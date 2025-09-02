@@ -22,7 +22,8 @@ dependencies = [
     "hydra-core",
     "omegaconf",
     "joblib",
-    "python-dotenv"
+    "python-dotenv",
+    "colorlog",
 ]
 
 [project.optional-dependencies]
