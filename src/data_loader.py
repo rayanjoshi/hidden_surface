@@ -1,3 +1,19 @@
+"""
+Data loader module for fetching and saving data from WRDS database.
+
+This module provides functionality to connect to the WRDS database, execute SQL
+queries, and save the resulting data to a CSV file. It uses Hydra for configuration
+management and integrates logging for monitoring the data loading process.
+
+Dependencies:
+    - os
+    - pathlib
+    - dotenv
+    - omegaconf
+    - hydra
+    - wrds
+    - scripts.logging_config
+"""
 import os
 from typing import Optional
 from pathlib import Path
@@ -10,6 +26,19 @@ from scripts.logging_config import get_logger, setup_logging, log_function_start
 load_dotenv()
 
 class DataLoader:
+    """
+    A class to handle data loading from WRDS database and saving to CSV.
+
+    Attributes:
+        cfg (DictConfig): Hydra configuration object containing data loader settings.
+        db (wrds.Connection): Connection to the WRDS database.
+        logger (logging.Logger): Logger instance for tracking operations.
+        username (str): WRDS database username from environment variables.
+        password (str): WRDS database password from environment variables.
+        sql_query (str): Path to the SQL query file from configuration.
+        sql_query_path (Path): Resolved path to the SQL query file.
+        save_path (Path): Resolved path where the data will be saved as CSV.
+    """
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
@@ -25,6 +54,12 @@ class DataLoader:
         self.save_path = Path(repo_root / self.save_path).resolve()
 
     def connect_to_database(self):
+        """
+        Establish a connection to the WRDS database.
+
+        Creates a connection using the provided username and password, and generates
+        a pgpass file for authentication.
+        """
         log_function_start("connect_to_database")
         self.logger.info("Connecting to WRDS database")
         self.db = wrds.Connection(wrds_username=self.username, wrds_password=self.password)
@@ -33,6 +68,14 @@ class DataLoader:
         log_function_end("connect_to_database")
 
     def load_data(self):
+        """
+        Load data from the WRDS database using an SQL query.
+
+        Reads the SQL query from a file and executes it against the database.
+
+        Returns:
+            pandas.DataFrame: The data retrieved from the SQL query.
+        """
         log_function_start("load_data")
         self.logger.info("Loading data from OptionMetrics")
         self.logger.info("Executing SQL query from %s", self.sql_query_path)
@@ -45,6 +88,12 @@ class DataLoader:
         return df
 
     def save_data(self, df):
+        """
+        Save the provided DataFrame to a CSV file.
+
+        Args:
+            df (pandas.DataFrame): The DataFrame to save.
+        """
         log_function_start("save_data")
         self.save_path.parent.mkdir(parents=True, exist_ok=True)
         self.logger.info("Saving data to %s", self.save_path)
@@ -55,6 +104,15 @@ class DataLoader:
 
 @hydra.main(version_base=None, config_path="../configs", config_name="data_loader")
 def main(cfg: Optional[DictConfig] = None):
+    """
+    Main function to orchestrate the data loading process.
+
+    Initializes logging, creates a DataLoader instance, connects to the database,
+    loads data, and saves it to a CSV file.
+
+    Args:
+        cfg (Optional[DictConfig]): Hydra configuration object, defaults to None.
+    """
     setup_logging(log_level="INFO", console_output=True, file_output=True)
     logger = get_logger("main")
     logger.info("Starting data loading process")
