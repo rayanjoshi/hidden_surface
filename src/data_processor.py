@@ -12,6 +12,8 @@ import numpy as np
 from omegaconf import DictConfig
 import hydra
 
+from scripts.logging_config import get_logger, setup_logging, log_function_start, log_function_end
+
 class DataProcessor:
     """
     Processes financial data according to specified configuration parameters.
@@ -24,6 +26,7 @@ class DataProcessor:
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
+        self.logger = get_logger("DataProcessor")
         script_dir = Path(__file__).parent
         repo_root = script_dir.parent
         self.input_path = Path(repo_root / self.cfg.data_loader.output_path).resolve()
@@ -42,9 +45,12 @@ class DataProcessor:
         Raises:
             KeyError: If required columns are missing from the input data.
         """
+        log_function_start("process_data")
         df = pd.read_csv(self.input_path)
+        self.logger.info("Loaded data with %d rows and %d columns", df.shape[0], df.shape[1])
         df.dropna(inplace=True)
         df.drop(['secid', 'optionid'], axis=1, inplace=True)
+        self.logger.info("Dropped the following columns: ['secid', 'optionid']")
 
         min_iv = self.cfg.data_processor.min_iv
         max_iv = self.cfg.data_processor.max_iv
@@ -93,6 +99,7 @@ class DataProcessor:
             df['mid'] = df['mid_quote']
         else:
             df['mid'] = np.nan
+        self.logger.info("Calculated 'mid' prices")
 
 
         if 'time_to_expiration' in df.columns and df['time_to_expiration'].notna().any():
@@ -109,19 +116,24 @@ class DataProcessor:
                     df['T_years'] = 0.0
             else:
                 df['T_years'] = 0.0
+        self.logger.info("Calculated 'T_years'")
 
 
         df['T_years'] = df['T_years'].clip(lower=1e-6)
+        self.logger.info("Clipped 'T_years' to avoid zero or negative values")
 
 
         underlying = df['underlying_close'].astype(float)
         strike = df['strike_price'].astype(float)
         df['moneyness'] = strike / underlying
         df = df[(df['moneyness'] >= moneyness_min) & (df['moneyness'] <= moneyness_max)]
+        self.logger.info("Filtered data based on moneyness between %.2f and %.2f", moneyness_min, moneyness_max)
 
         df['forward'] = underlying * np.exp((r - q) * df['T_years'])
+        self.logger.info("Calculated 'forward' prices")
 
         df['log_moneyness'] = np.log(strike / df['forward'].clip(lower=1e-12))
+        self.logger.info("Calculated 'log_moneyness'")
 
         if 'open_interest' in df.columns:
             oi_by_exp = df.groupby('expiration')['open_interest'].sum()
@@ -129,10 +141,9 @@ class DataProcessor:
             df = df[df['expiration'].isin(valid_exps)]
 
         df.dropna(subset=['mid', 'moneyness', 'T_years', 'log_moneyness'], inplace=True)
+        self.logger.info("Processed data now has %d rows and %d columns", df.shape[0], df.shape[1])
 
-        if 'volume' in df.columns:
-            df['volume'] = df['volume'].astype(float)
-
+        log_function_end("process_data")
         return df
 
     def save_data(self, df: pd.DataFrame):
@@ -142,8 +153,12 @@ class DataProcessor:
         Args:
             df: DataFrame to be saved as a CSV file.
         """
+        log_function_start("save_data")
+        self.logger.info("Saving processed data to %s", self.output_path)
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(self.output_path, index=False)
+        self.logger.info("Processed data saved successfully")
+        log_function_end("save_data")
 
 @hydra.main(version_base=None, config_path="../configs", config_name="data_processor")
 def main(cfg: Optional[DictConfig] = None):
@@ -156,6 +171,9 @@ def main(cfg: Optional[DictConfig] = None):
     Args:
         cfg: Configuration object, defaults to None.
     """
+    setup_logging(log_level="INFO", console_output=True, file_output=True)
+    logger = get_logger("main")
+    logger.info("Starting data processing...")
     data_processor = DataProcessor(cfg)
     df = data_processor.process_data()
     data_processor.save_data(df)
