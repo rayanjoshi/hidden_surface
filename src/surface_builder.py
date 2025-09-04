@@ -55,9 +55,6 @@ class MarketSurfaceBuilder:
     def load_data(self):
         """
         Load market data from the input path.
-
-        Returns:
-            pd.DataFrame: DataFrame containing the loaded market data.
         """
         log_function_start("load_data")
         self.df = pd.read_csv(self.input_path)
@@ -167,7 +164,7 @@ class MarketSurfaceBuilder:
 
         fig, axes = plt.subplots(1,2, figsize=(15,6))
         _unused = fig
-        im1 = axes[0].imshow(self.iv_surface.T,
+        im1 = axes[0].imshow(self.iv_surface.maturity,
                                 aspect='auto',
                                 extent=(self.grid_maturities[0], self.grid_maturities[-1],
                                         self.grid_log_moneyness[0], self.grid_log_moneyness[-1]),
