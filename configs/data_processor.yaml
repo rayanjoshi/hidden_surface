@@ -10,6 +10,5 @@ data_processor:
   moneyness_min: 0.5
   moneyness_max: 1.5
   min_open_interest: 100.0
-  risk_free_rate: 0.0
   dividend_yield: 0.0
   days_in_year: 365.0

@@ -1,6 +1,7 @@
 -- OptionMetrics: Comprehensive Option, Underlying, and Rate Data for TSLA (2020-2023)
 -- This query pulls all available option data including full Greeks, bid/ask spreads, and market data
 -- Uses UNION ALL to combine data from multiple yearly tables to exhaust all options
+-- Added Fama-French 3 Factors Plus Momentum (Mkt-RF, SMB, HML, UMD) and Risk-Free Rate (RF) from ff.factors_daily
 
 -- 2020 Data
 SELECT
@@ -38,12 +39,20 @@ SELECT
         WHEN o.best_bid > 0 AND o.best_offer > 0 AND o.best_offer > o.best_bid 
         THEN 1 
         ELSE 0 
-    END AS valid_pricing
+    END AS valid_pricing,
+    f.mktrf AS market_excess_return,
+    f.smb AS smb,
+    f.hml AS hml,
+    f.umd AS momentum,
+    f.rf AS risk_free_rate
 FROM
     optionm.opprcd2020 o
 LEFT JOIN
     optionm.secprd2020 u
     ON o.secid = u.secid AND o.date = u.date
+LEFT JOIN
+    ff.factors_daily f
+    ON o.date = f.date
 WHERE
     o.secid = 143439  -- TSLA secid
     AND o.date >= '2020-01-01'
@@ -88,12 +97,20 @@ SELECT
         WHEN o.best_bid > 0 AND o.best_offer > 0 AND o.best_offer > o.best_bid 
         THEN 1 
         ELSE 0 
-    END AS valid_pricing
+    END AS valid_pricing,
+    f.mktrf AS market_excess_return,
+    f.smb AS smb,
+    f.hml AS hml,
+    f.umd AS momentum,
+    f.rf AS risk_free_rate
 FROM
     optionm.opprcd2021 o
 LEFT JOIN
     optionm.secprd2021 u
     ON o.secid = u.secid AND o.date = u.date
+LEFT JOIN
+    ff.factors_daily f
+    ON o.date = f.date
 WHERE
     o.secid = 143439
     AND o.best_bid IS NOT NULL
@@ -137,12 +154,20 @@ SELECT
         WHEN o.best_bid > 0 AND o.best_offer > 0 AND o.best_offer > o.best_bid 
         THEN 1 
         ELSE 0 
-    END AS valid_pricing
+    END AS valid_pricing,
+    f.mktrf AS market_excess_return,
+    f.smb AS smb,
+    f.hml AS hml,
+    f.umd AS momentum,
+    f.rf AS risk_free_rate
 FROM
     optionm.opprcd2022 o
 LEFT JOIN
     optionm.secprd2022 u
     ON o.secid = u.secid AND o.date = u.date
+LEFT JOIN
+    ff.factors_daily f
+    ON o.date = f.date
 WHERE
     o.secid = 143439
     AND o.best_bid IS NOT NULL
@@ -186,12 +211,20 @@ SELECT
         WHEN o.best_bid > 0 AND o.best_offer > 0 AND o.best_offer > o.best_bid 
         THEN 1 
         ELSE 0 
-    END AS valid_pricing
+    END AS valid_pricing,
+    f.mktrf AS market_excess_return,
+    f.smb AS smb,
+    f.hml AS hml,
+    f.umd AS momentum,
+    f.rf AS risk_free_rate
 FROM
     optionm.opprcd2023 o
 LEFT JOIN
     optionm.secprd2023 u
     ON o.secid = u.secid AND o.date = u.date
+LEFT JOIN
+    ff.factors_daily f
+    ON o.date = f.date
 WHERE
     o.secid = 143439
     AND o.date <= '2023-12-31'

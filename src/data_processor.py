@@ -57,7 +57,7 @@ class DataProcessor:
         moneyness_min = self.cfg.data_processor.moneyness_min
         moneyness_max = self.cfg.data_processor.moneyness_max
         min_open_interest = self.cfg.data_processor.min_open_interest
-        r = self.cfg.data_processor.risk_free_rate
+        r = df['risk_free_rate']
         q = self.cfg.data_processor.dividend_yield
         days_in_year = self.cfg.data_processor.days_in_year
 
@@ -127,7 +127,8 @@ class DataProcessor:
         strike = df['strike_price'].astype(float)
         df['moneyness'] = strike / underlying
         df = df[(df['moneyness'] >= moneyness_min) & (df['moneyness'] <= moneyness_max)]
-        self.logger.info("Filtered data based on moneyness between %.2f and %.2f", moneyness_min, moneyness_max)
+        self.logger.info("Filtered data based on moneyness between %.2f and %.2f",
+                            moneyness_min, moneyness_max)
 
         df['forward'] = underlying * np.exp((r - q) * df['T_years'])
         self.logger.info("Calculated 'forward' prices")
