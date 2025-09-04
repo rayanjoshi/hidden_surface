@@ -1,2 +1,5 @@
 defaults:
   - data_loader
+  - data_processor
+  - surface_builder
+  - forward_variance
