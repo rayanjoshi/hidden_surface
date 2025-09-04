@@ -104,7 +104,7 @@ class DataProcessor:
 
         if 'time_to_expiration' in df.columns and df['time_to_expiration'].notna().any():
 
-            df['T_years'] = df['time_to_expiration'].astype(float) / days_in_year
+            df['T_years'] = df['time_to_expiration'].astype(float)
         else:
 
             if 'date' in df.columns and 'expiration' in df.columns:
