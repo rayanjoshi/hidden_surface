@@ -1,0 +1,8 @@
+defaults:
+- _self_
+- data_processor
+
+surface_builder:
+  n_maturity_bins: 50
+  n_moneyness_bins: 100
+  output_dir: "data/iv_surface"
