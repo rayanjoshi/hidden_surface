@@ -101,10 +101,8 @@ class ForwardVarianceCalculator:
         maturities = np.array(maturities)[sorted_idx]
         theta_values = np.array(theta_values)[sorted_idx]
 
-
         if len(theta_values) > 3:
             theta_values = gaussian_filter1d(theta_values, sigma=self.sigma)
-
 
         w_values = maturities * theta_values
         w_values = np.maximum.accumulate(w_values)
@@ -113,9 +111,8 @@ class ForwardVarianceCalculator:
             maturities = np.insert(maturities, 0, 0)
             w_values = np.insert(w_values, 0, 0)
 
-
         var_est = np.var(w_values) if len(w_values) > 1 else 1e-4
-        smooth_factor = len(maturities) * var_est ** 0.5  # Adaptive smoothing
+        smooth_factor = len(maturities) * var_est ** 0.5
         spl = interpolate.splrep(maturities, w_values, s=smooth_factor, k=min(3, len(maturities)-1))
 
         self.forward_variance_curve = lambda t: max(interpolate.splev(t, spl, der=1), 1e-4)
@@ -174,8 +171,10 @@ class ForwardVarianceCalculator:
                 var_contribution += integrand[0] * (strikes[0] * 0.01)  # Approx
 
         if var_contribution <= 0:
-            self.logger.warning("Non-positive var_contribution for maturity=%f; using ATM approximation",
-                                maturity)
+            self.logger.warning(
+                "Non-positive var_contribution; using ATM approximation for maturity=%f",
+                maturity,
+            )
             return self._atm_approx(df, maturity)
 
         r = df["risk_free_rate"].iloc[0]
