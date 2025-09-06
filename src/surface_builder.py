@@ -10,7 +10,7 @@ from omegaconf import DictConfig
 import hydra
 import pandas as pd
 import numpy as np
-from scipy.interpolate import griddata
+from scipy.interpolate import griddata, interp1d
 from scipy.ndimage import gaussian_filter
 import matplotlib.pyplot as plt
 
@@ -48,6 +48,7 @@ class MarketSurfaceBuilder:
         self.n_moneyness_bins = self.cfg.surface_builder.n_moneyness_bins
         self.grid_maturities = None
         self.grid_log_moneyness = None
+        self.grid_risk_free_rates = None
 
         self.raw_points = None
         self.iv_surface = None
@@ -84,6 +85,42 @@ class MarketSurfaceBuilder:
 
         log_function_end("create_market_grid")
         return self.grid_maturities, self.grid_log_moneyness
+
+    def interpolate_risk_free_rates(self):
+        """
+        Interpolate the risk-free rates (yields) for the maturity grid points.
+        
+        Returns:
+            np.ndarray: Interpolated risk free rates grid
+        """
+        log_function_start("interpolate_risk_free_rates")
+
+        unique_mats = np.sort(self.df["T_years"].unique())
+        mean_rates_series = self.df.groupby("T_years")["risk_free_rate"].mean()
+        mean_rates = mean_rates_series.reindex(unique_mats).to_numpy()
+        valid_mask = ~np.isnan(mean_rates)
+        unique_mats = unique_mats[valid_mask]
+        mean_rates = mean_rates[valid_mask]
+
+        if len(unique_mats) < 2:
+            self.logger.warning("Insufficient unique maturities for interpolation; "
+                                "using constant risk-free rate.")
+            default_rate = mean_rates[0] if len(mean_rates) > 0 else 0.0
+            self.grid_risk_free_rates = np.full_like(self.grid_maturities, default_rate)
+        else:
+            r_interp = interp1d(unique_mats,
+                                mean_rates,
+                                kind='linear',
+                                fill_value='extrapolate',
+                                bounds_error=False,
+                                )
+            self.grid_risk_free_rates = r_interp(self.grid_maturities)
+            self.grid_risk_free_rates = np.nan_to_num(self.grid_risk_free_rates, nan=0.0)
+
+        self.logger.info("Interpolated risk-free rates on the market grid")
+
+        log_function_end("interpolate_risk_free_rates")
+        return self.grid_risk_free_rates
 
     def interpolate_surface(self):
         """
@@ -153,6 +190,9 @@ class MarketSurfaceBuilder:
         np.save(self.output_dir / "grid_log_moneyness.npy", self.grid_log_moneyness)
         self.logger.info("Saved grid log moneyness to %s",
                             self.output_dir / "grid_log_moneyness.npy")
+        np.save(self.output_dir / "grid_risk_free_rates.npy", self.grid_risk_free_rates)
+        self.logger.info("Saved grid risk free rates to %s",
+                            self.output_dir / "grid_risk_free_rates.npy")
 
         log_function_end("save_data")
 
@@ -164,10 +204,11 @@ class MarketSurfaceBuilder:
 
         fig, axes = plt.subplots(1,2, figsize=(15,6))
         _unused = fig
-        im1 = axes[0].imshow(self.iv_surface.maturity,
+        im1 = axes[0].imshow(self.iv_surface,
                                 aspect='auto',
                                 extent=(self.grid_maturities[0], self.grid_maturities[-1],
                                         self.grid_log_moneyness[0], self.grid_log_moneyness[-1]),
+                                origin='lower'
                                 )
 
         axes[0].set_title("Implied Volatility Surface")
@@ -206,6 +247,7 @@ def main(cfg: Optional[DictConfig] = None):
     surface_builder = MarketSurfaceBuilder(cfg)
     surface_builder.load_data()
     surface_builder.create_market_grid()
+    surface_builder.interpolate_risk_free_rates()
     surface_builder.interpolate_surface()
     surface_builder.save_data()
     surface_builder.plot_surface()
