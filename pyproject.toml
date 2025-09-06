@@ -25,6 +25,7 @@ dependencies = [
     "joblib",
     "python-dotenv",
     "colorlog",
+    "numba",
 ]
 
 [project.optional-dependencies]
