@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import brentq
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, splev, splrep
 from scipy.optimize import least_squares
 import hydra
 from omegaconf import DictConfig
@@ -32,13 +32,14 @@ def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
             model_price = black_scholes_call(s, k, t, r, q, sigma)
             return model_price - price
         try:
-            iv = brentq(objective, 0.001, 10.0, maxiter=200)
+            iv = brentq(objective, 0.001, 20.0, maxiter=500)
             log_function_end("implied_volatility_call")
             return iv
         except ValueError as e:
             log_function_end("implied_volatility_call")
             get_logger("implied_volatility_call").warning(f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}: {e}")
-            return np.nan
+            iv = 0.001
+            return iv
 
 @njit
 def get_power_law_coefficients(alpha, steps):
@@ -65,18 +66,6 @@ def get_kernel_values(alpha, steps, time_step):
     return kernel
 
 @njit
-def next_power_of_2(n):
-    """Compute the smallest power of 2 greater than or equal to n."""
-    if n <= 0:
-        return 1
-    n -= 1
-    power = 1
-    while n > 0:
-        n >>= 1
-        power <<= 1
-    return power
-
-@njit
 def compute_convolution(kernel, delta_w1):
     n = len(kernel)
     m = len(delta_w1)
@@ -88,8 +77,10 @@ def compute_convolution(kernel, delta_w1):
     return result[:len(delta_w1)]
 
 @njit(parallel=True)
-def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst, rho, f_variance, all_g1, all_z, all_g2):
+def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
+                            rho, f_variance, all_g1, all_z, all_g2, short_rates):
     alpha = hurst - 0.5
+    alpha = max(alpha, -0.45)
     dt = maturity / n_steps
     kernel = get_kernel_values(alpha, (n_steps + 1), dt)
     s_paths = np.zeros((n_paths, n_steps + 1))
@@ -124,10 +115,8 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst, rho, f_varia
             if variance[i - 1] <= 0:
                 variance[i - 1] = min_variance
             sqrt_variance = np.sqrt(variance[i - 1])
-            d_log_s = -0.5 * variance[i - 1] * dt + sqrt_variance * delta_ws[i]
+            d_log_s = (short_rates[i - 1] - 0.5 * variance[i - 1]) * dt + sqrt_variance * delta_ws[i]
             s = s * np.exp(d_log_s)
-            if np.isnan(s) or s <= 0:
-                s = 1.0
             s_paths[p, i] = s
     return s_paths, variance_paths
 
@@ -157,33 +146,41 @@ class RoughBergomiEngine:
         if np.any(np.isnan(self.log_moneyness)):
             raise ValueError("Log moneyness contain NaN values")
         self.strikes = np.exp(self.log_moneyness)
+        self.risk_free_rate_path = Path(repo_root / self.cfg.iv_surface.risk_free_rate_path).resolve()
+        self.risk_free_rate = np.load(self.risk_free_rate_path)
 
         if np.any(np.isnan(self.maturities)) or np.any(self.maturities <= 0):
             raise ValueError("Maturities contain NaN or non-positive values")
 
+        risk_free_rates = self.risk_free_rate.copy()
+        if self.maturities[0] > 0:
+            self.maturities = np.insert(self.maturities, 0, 0)
+            risk_free_rates = np.insert(self.risk_free_rate, 0, self.risk_free_rate[0])
+        self.yield_spl = splrep(self.maturities, risk_free_rates, s=0, k=3)
+        
         if self.df["maturity_years"].isnull().any() or self.df["forward_variance"].isnull().any():
             raise ValueError("Forward variance data contains NaN values")
         if (self.df["forward_variance"] <= 0).any():
             raise ValueError("Forward variance contains non-positive values")
 
         self.logger.info(f"Forward variance data range: {min(self.df['maturity_years'])} to {max(self.df['maturity_years'])}")
-        self.risk_free_rate = 0.0 # placeholder for risk-free rate
-        self.risk_free_func = None
 
-    def get_risk_free_rate(self, t):
-        if np.isscalar(self.risk_free_rate):
-            if hasattr(t, "__len__"):
-                return np.full_like(t, float(self.risk_free_rate))
-            return float(self.risk_free_rate)
 
-        if self.risk_free_rate is not None:
-            self.risk_free_func = interp1d(self.maturities,
-                                            self.risk_free_rate,
-                                            kind='linear',
-                                            fill_value='extrapolate',
-                                            )
-            return self.risk_free_func(t)
-        return 0.0
+    def get_yield(self, t):
+        return splev(t, self.yield_spl, ext=0)
+
+    def get_short_rate(self, t):
+        if np.isscalar(t):
+            if t <= 0:
+                t = 1e-6
+            R = splev(t, self.yield_spl, ext=0)
+            dRdt = splev(t, self.yield_spl, der=1, ext=0)
+            return R + t * dRdt
+        else:
+            t = np.maximum(t, 1e-6)
+            R = splev(t, self.yield_spl, ext=0)
+            dRdt = splev(t, self.yield_spl, der=1, ext=0)
+            return R + t * dRdt
 
     def price_options(self, strikes, maturities, params,
                         n_paths=50000, n_steps=512, return_iv=False):
@@ -192,6 +189,7 @@ class RoughBergomiEngine:
         dt = max_t / n_steps
         t = np.linspace(0, max_t, n_steps + 1)
         xi = self.forward_variance_func(t)
+        short_rates = self.get_short_rate(t)
         if np.any(xi <= 0) or np.any(np.isnan(xi)):
             self.logger.error(f"Invalid forward variance values: {xi}")
             raise ValueError("Forward variance contains non-positive or NaN values")
@@ -210,7 +208,8 @@ class RoughBergomiEngine:
             all_g2 = all_g2[:n_paths, :]
 
         s_paths, variance_paths = simulate_rbergomi_paths(n_paths, n_steps, max_t,
-                                                eta, hurst, rho, xi, all_g1, all_z, all_g2)
+                                                eta, hurst, rho, xi, all_g1, all_z,
+                                                all_g2, short_rates)
         if np.any(np.isnan(s_paths)) or np.any(s_paths <= 0):
             self.logger.error("Stock paths contain NaN or non-positive values")
             raise ValueError("Invalid stock paths")
@@ -221,15 +220,16 @@ class RoughBergomiEngine:
         for m, maturity in enumerate(maturities):
             index = int(maturity / dt)
             s_t = s_paths[:, index]
-            r = self.get_risk_free_rate(maturity)
+            r = self.get_yield(maturity)
+            discount = np.exp(-r * maturity)
             for k, strike in enumerate(strikes):
                 payoff = np.maximum(s_t - strike, 0)
-                discounted = np.mean(payoff) * np.exp(-r * maturity)
+                discounted = np.mean(payoff) * discount
                 prices[m, k] = discounted if discounted > 1e-12 else 1e-12
         if return_iv:
             ivs = np.zeros(prices.shape)
             for m, maturity in enumerate(maturities):
-                r = self.get_risk_free_rate(maturity)
+                r = self.get_yield(maturity)
                 for k, strike in enumerate(strikes):
                     if prices[m, k] <= 0 or np.isnan(prices[m, k]):
                         self.logger.warning(f"Invalid price at maturity {maturity}, strike {strike}: {prices[m, k]}")
@@ -240,17 +240,23 @@ class RoughBergomiEngine:
         return prices
 
     def calibrate(self, target_prices, strikes, maturities, initial_params):
+        valid_indices = maturities >= 0.01
+        filtered_maturities = maturities[valid_indices]
+        filtered_target_prices = target_prices[valid_indices]
+        filtered_strikes = strikes
+        self.logger.info(f"Filtered to {len(filtered_maturities)} maturities >= 0.01")
         def objective(params):
-            model_prices = self.price_options(strikes, maturities, params)
+            model_prices = self.price_options(filtered_strikes, filtered_maturities, params)
             if np.any(np.isnan(model_prices)) or np.any(model_prices <= 0):
                 self.logger.warning(f"Invalid model prices for params {params}: {model_prices}")
-                # Return large residual vector so least_squares can handle it
-                return np.full(target_prices.size, 1e10)
+                return np.full(filtered_target_prices.size, 1e6)
 
-            # residuals between model and market prices
-            diff = (model_prices - target_prices).flatten()
+            valid_mask = (filtered_target_prices > 0) & np.isfinite(filtered_target_prices)
+            if not np.any(valid_mask):
+                return np.full(filtered_target_prices.size, 1e6)
 
-            # add regularization as extra residuals (not a single scalar)
+            norm_target = np.where(valid_mask, filtered_target_prices, 1.0)  # Avoid div-by-zero
+            diff = ((model_prices - filtered_target_prices) / norm_target).flatten()
             penalty = 0.1 * (params - initial_params)
             return np.concatenate([diff, penalty])
 
@@ -268,10 +274,10 @@ class RoughBergomiEngine:
         optimal_params = res.x
 
         # Compute fitted IVs
-        fitted_prices = self.price_options(strikes, maturities, optimal_params)
+        fitted_prices = self.price_options(filtered_strikes, filtered_maturities, optimal_params)
         fitted_ivs = np.zeros(fitted_prices.shape)
-        for m, maturity in enumerate(maturities):
-            r = self.get_risk_free_rate(maturity)
+        for m, maturity in enumerate(filtered_maturities):
+            r = self.get_yield(maturity)
             for k, strike in enumerate(strikes):
                 if fitted_prices[m, k] <= 0 or np.isnan(fitted_prices[m, k]):
                     fitted_ivs[m, k] = np.nan
@@ -287,12 +293,12 @@ class RoughBergomiEngine:
             'rho': optimal_params[2],
         }
         result.fitted_ivs = fitted_ivs
-        result.market_ivs = self.iv_surface
+        result.market_ivs = self.iv_surface[valid_indices]
 
-        valid_mask = np.isfinite(fitted_ivs) & np.isfinite(self.iv_surface)
+        valid_mask = np.isfinite(fitted_ivs) & np.isfinite(result.market_ivs)
         if np.any(valid_mask):
             result.rmse = np.sqrt(
-                np.mean((fitted_ivs[valid_mask] - self.iv_surface[valid_mask]) ** 2)
+                np.mean((fitted_ivs[valid_mask] - result.market_ivs[valid_mask]) ** 2)
             )
         else:
             result.rmse = np.nan
@@ -358,14 +364,24 @@ def main(cfg: Optional[DictConfig] = None):
         strikes=rbergomi_model.strikes,
         maturities=maturities,
         params=initial_params,
-        n_paths=10000,
+        n_paths=50000,
         n_steps=512,
         return_iv=False
     )
     logger.info(f"Option prices:\n{option_prices}")
 
     logger.info("Calibrating model...")
-    target_prices = rbergomi_model.iv_surface
+    market_prices = np.zeros_like(rbergomi_model.iv_surface)
+    for m, maturity in enumerate(maturities):
+        r = rbergomi_model.get_yield(maturity)
+        for k, strike in enumerate(rbergomi_model.strikes):
+            if np.isnan(rbergomi_model.iv_surface[m, k]) or rbergomi_model.iv_surface[m, k] <= 0:
+                market_prices[m, k] = np.nan
+            else:
+                market_prices[m, k] = black_scholes_call(
+                    s=1.0, k=strike, t=maturity, r=r, q=0, sigma=rbergomi_model.iv_surface[m, k]
+                )
+    target_prices = market_prices
     calibration_result = rbergomi_model.calibrate(
         target_prices=target_prices,
         strikes=rbergomi_model.strikes,
