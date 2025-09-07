@@ -195,6 +195,7 @@ class RoughBergomiEngine:
             raise ValueError("Forward variance contains non-positive or NaN values")
         self.logger.info(f"Forward variance shape: {xi.shape}, values: {xi[:5]}...")
 
+        np.random.seed(42)
         all_g1 = np.random.randn(n_paths // 2, n_steps)
         all_g1 = np.vstack([all_g1, -all_g1])
         all_z = np.random.randn(n_paths // 2, n_steps)
@@ -255,20 +256,26 @@ class RoughBergomiEngine:
             if not np.any(valid_mask):
                 return np.full(filtered_target_prices.size, 1e6)
 
-            norm_target = np.where(valid_mask, filtered_target_prices, 1.0)  # Avoid div-by-zero
-            diff = ((model_prices - filtered_target_prices) / norm_target).flatten()
-            penalty = 0.1 * (params - initial_params)
-            return np.concatenate([diff, penalty])
+            model_flat = model_prices[valid_mask]
+            target_flat = filtered_target_prices[valid_mask]
+            relative_errors = (model_flat - target_flat) / target_flat
 
-        bounds = ([0.1, 0.01, -1], [2.0, 0.5, 0])
+            penalty = 0.001 * np.sum([(p - ip)**2 for p, ip in zip(params, initial_params)])
+            penalty_scaled = penalty * np.sqrt(len(relative_errors))
+            return np.concatenate([relative_errors, np.array([penalty_scaled])])
+
+        bounds = ([0.05, 0.005, -0.99], [2.0, 0.5, 0.99])
         res = least_squares(
             objective,
             initial_params,
             bounds=bounds,
-            max_nfev=1000,
+            method='trf',
+            max_nfev=5000,
             ftol=1e-8,
             gtol=1e-8,
-            xtol=1e-8
+            xtol=1e-8,
+            loss='soft_l1',
+            verbose=2
         )
 
         optimal_params = res.x
@@ -349,7 +356,6 @@ def main(cfg: Optional[DictConfig] = None):
     setup_logging(log_level="INFO", console_output=True, file_output=True)
     logger = get_logger("main")
     logger.info("Starting rough bergomi model calculation...")
-    np.random.seed(42)
     rbergomi_model = RoughBergomiEngine(cfg)
 
     script_dir = Path(__file__).parent
