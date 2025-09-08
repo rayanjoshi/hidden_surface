@@ -37,11 +37,11 @@ def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
             model_price = black_scholes_call(s, k, t, r, q, sigma)
             return model_price - price
         try:
-            iv = brentq(objective, 0.001, 20.0, maxiter=500)
+            iv = brentq(objective, 0.0001, 20.0, maxiter=500)
             return iv
         except ValueError as e:
             get_logger("implied_volatility_call").warning(f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}: {e}")
-            iv = 0.001
+            iv = np.nan
             return iv
 
 @njit
@@ -69,15 +69,13 @@ def get_kernel_values(alpha, steps, time_step):
     return kernel
 
 @njit
-def compute_convolution(kernel, delta_w1):
+def create_toeplitz(kernel):
     n = len(kernel)
-    m = len(delta_w1)
-    result = np.zeros(n + m - 1)
-    for i in range(n + m - 1):
-        for j in range(max(0, i - m + 1), min(n, i + 1)):
-            if i - j < m:
-                result[i] += kernel[j] * delta_w1[i - j]
-    return result[:len(delta_w1)]
+    T = np.zeros((n, n))
+    for j in range(n):
+        for i in range(j, n):
+            T[i, j] = kernel[i - j]
+    return T
 
 @njit(parallel=True)
 def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
@@ -85,42 +83,56 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
     alpha = hurst - 0.5
     alpha = max(alpha, -0.45)
     dt = maturity / n_steps
-    kernel = get_kernel_values(alpha, (n_steps + 1), dt)
-    s_paths = np.zeros((n_paths, n_steps + 1))
-    variance_paths = np.zeros((n_paths, n_steps + 1))
-    t = np.linspace(0, maturity, n_steps + 1)
+    n_time = n_steps + 1
+    kernel = get_kernel_values(alpha, n_time, dt)
+    toeplitz = create_toeplitz(kernel)
+    covariance_factor = dt ** (2 * alpha + 1) / (2 * alpha + 1)
+
+    delta_w1 = np.zeros((n_paths, n_time))
+    delta_w1[:, 1:] = all_g1 * np.sqrt(dt)
+    delta_w2 = np.zeros((n_paths, n_time))
+    delta_w2[:, 1:] = all_z * np.sqrt(dt)
+    delta_ws = rho * delta_w1 + np.sqrt(1 - rho ** 2) * delta_w2
+
+    recent_with_zero = np.zeros((n_paths, n_time))
+    recent_with_zero[:, 1:] = np.sqrt(covariance_factor) * all_g2
+
+    s_paths = np.zeros((n_paths, n_time))
+    variance_paths = np.zeros((n_paths, n_time))
     s_paths[:, 0] = 1.0
+    variance_paths[:, 0] = f_variance[0]
+
+    w = np.zeros((n_paths, n_time))
+    for p in prange(n_paths): # pylint: disable=not-an-iterable
+        conv = np.dot(toeplitz, delta_w1[p])
+        w[p] = conv + recent_with_zero[p]
+    w[:, 0] = 0
+
+    t = np.linspace(0, maturity, n_time)
+    t_2h = t ** (2 * hurst)
+    t_2h_tile = np.zeros((n_paths, n_time))
+    for p in prange(n_paths): # pylint: disable=not-an-iterable
+        t_2h_tile[p, :] = t_2h
+    exponent = eta * np.sqrt(2 * hurst) * w - 0.5 * (eta ** 2) * t_2h_tile
+    exponent = np.clip(exponent, -100, 100)
+    f_variance_tile = np.zeros((n_paths, n_time))
+    for p in prange(n_paths): # pylint: disable=not-an-iterable
+        f_variance_tile[p, :] = f_variance
+    variance_paths = f_variance_tile * np.exp(exponent)
     min_variance = 1e-10
-    for p in prange(n_paths):  # pylint: disable=not-an-iterable
-        variance_paths[p, 0] = f_variance[0]
-        delta_w1 = np.zeros(n_steps + 1)
-        delta_w1[1:] = all_g1[p] * np.sqrt(dt)
-        covariance_factor = dt ** (2 * alpha + 1) / (2 * alpha + 1)
-        recent = np.sqrt(covariance_factor) * all_g2[p]
-        recent_with_zero = np.zeros(len(recent) + 1)
-        recent_with_zero[1:] = recent
-        conv = compute_convolution(kernel, delta_w1)
-        w = conv + recent_with_zero
-        w[0] = 0
-        delta_w2 = np.zeros(n_steps + 1)
-        delta_w2[1:] = np.sqrt(dt) * all_z[p]
-        delta_ws = rho * delta_w1 + np.sqrt(1 - rho ** 2) * delta_w2
-        pow_term = t ** (2 * hurst)
+    variance_paths = np.maximum(variance_paths, min_variance)
 
-        exponent = eta * np.sqrt(2 * hurst) * w - 0.5 * (eta ** 2) * pow_term
-        exponent = np.clip(exponent, -100, 100)
-        variance = f_variance * np.exp(exponent)
-        variance = np.maximum(variance, min_variance)
-        variance_paths[p] = variance
+    # Vectorized stock path update with prange for cumsum
+    sqrt_variance = np.sqrt(variance_paths[:, :-1])
+    short_rates_tile = np.zeros((n_paths, n_steps))
+    for p in prange(n_paths): # pylint: disable=not-an-iterable
+        short_rates_tile[p, :] = short_rates[:-1]
+    d_log_s = (short_rates_tile - 0.5 * variance_paths[:, :-1]) * dt + sqrt_variance * delta_ws[:, 1:]
+    log_s_cum = np.zeros_like(d_log_s)
+    for p in prange(n_paths): # pylint: disable=not-an-iterable
+        log_s_cum[p] = np.cumsum(d_log_s[p])
+    s_paths[:, 1:] = np.exp(log_s_cum)
 
-        s = 1.0
-        for i in range(1, n_steps + 1):
-            if variance[i - 1] <= 0:
-                variance[i - 1] = min_variance
-            sqrt_variance = np.sqrt(variance[i - 1])
-            d_log_s = (short_rates[i - 1] - 0.5 * variance[i - 1]) * dt + sqrt_variance * delta_ws[i]
-            s = s * np.exp(d_log_s)
-            s_paths[p, i] = s
     return s_paths, variance_paths
 
 class RoughBergomiEngine:
@@ -186,8 +198,9 @@ class RoughBergomiEngine:
             return R + t * dRdt
 
     def price_options(self, strikes, maturities, params,
-                        n_paths=50000, n_steps=512, return_iv=False):
+                  n_paths=50000, n_steps=512, return_iv=False):
         eta, hurst, rho = params
+        n_steps = 2048 if max(maturities) < 0.1 else n_steps
         max_t = max(maturities)
         dt = max_t / n_steps
         t = np.linspace(0, max_t, n_steps + 1)
@@ -212,28 +225,28 @@ class RoughBergomiEngine:
             all_g2 = all_g2[:n_paths, :]
 
         s_paths, variance_paths = simulate_rbergomi_paths(n_paths, n_steps, max_t,
-                                                eta, hurst, rho, xi, all_g1, all_z,
-                                                all_g2, short_rates)
+                                                        eta, hurst, rho, xi, all_g1, all_z,
+                                                        all_g2, short_rates)
         if np.any(np.isnan(s_paths)) or np.any(s_paths <= 0):
             self.logger.error("Stock paths contain NaN or non-positive values")
             raise ValueError("Invalid stock paths")
         if np.any(np.isnan(variance_paths)) or np.any(variance_paths <= 0):
             self.logger.error("Variance paths contain NaN or non-positive values")
             raise ValueError("Invalid variance paths")
-        prices = np.zeros((len(maturities), len(strikes)))
-        for m, maturity in enumerate(maturities):
-            index = int(maturity / dt)
-            s_t = s_paths[:, index]
-            r = self.get_yield(maturity)
-            discount = np.exp(-r * maturity)
-            for k, strike in enumerate(strikes):
-                payoff = np.maximum(s_t - strike, 0)
-                discounted = np.mean(payoff) * discount
-                prices[m, k] = discounted if discounted > 1e-12 else 1e-12
+
+        # Vectorized pricing
+        indices = np.round(maturities / dt).astype(int)
+        s_t_all = s_paths[:, indices]
+        yields = self.get_yield(maturities)
+        discounts = np.exp(-yields * maturities)
+        payoffs = np.maximum(s_t_all[:, :, None] - strikes[None, None, :], 0)
+        prices = np.mean(payoffs, axis=0) * discounts[:, None]
+        prices = np.maximum(prices, 1e-12)
+
         if return_iv:
             ivs = np.zeros(prices.shape)
             for m, maturity in enumerate(maturities):
-                r = self.get_yield(maturity)
+                r = yields[m]
                 for k, strike in enumerate(strikes):
                     if prices[m, k] <= 0 or np.isnan(prices[m, k]):
                         self.logger.warning(f"Invalid price at maturity {maturity}, strike {strike}: {prices[m, k]}")
@@ -375,7 +388,7 @@ def main(cfg: Optional[DictConfig] = None):
         maturities=maturities,
         params=initial_params,
         n_paths=50000,
-        n_steps=512,
+        n_steps=1024,
         return_iv=False
     )
     logger.info(f"Option prices:\n{option_prices}")
