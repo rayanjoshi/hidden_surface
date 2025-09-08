@@ -11,21 +11,26 @@ from omegaconf import DictConfig
 from numba import njit, prange
 import matplotlib.pyplot as plt
 
-from scripts.logging_config import get_logger, setup_logging, log_function_start, log_function_end
-
+from scripts.logging_config import get_logger, setup_logging
 
 def black_scholes_call(s, k, t, r=0, q=0, sigma = 0.2):
-    log_function_start("black_scholes_call")
-    d1 = (np.log(s / k) + (r - q + 0.5 * sigma ** 2) * t) / (sigma * np.sqrt(t))
-    d2 = d1 - sigma * np.sqrt(t)
-    result = s * np.exp(-q * t) * norm.cdf(d1) - k * np.exp(-r * t) * norm.cdf(d2)
-    log_function_end("black_scholes_call")
-    return result
+    s = np.asarray(s)
+    k = np.asarray(k)
+    t = np.asarray(t)
+    r = np.asarray(r) if not isinstance(r, float) else r
+    q = np.asarray(q) if not isinstance(q, float) else q
+    sigma = np.asarray(sigma) if not isinstance(sigma, float) else sigma
+
+    sigma = np.where(sigma < 1e-10, 1e-10, sigma)
+    sqrt_t = np.sqrt(t)
+    d1 = (np.log(s / k) + (r - q + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t + 1e-10)
+    d2 = d1 - sigma * sqrt_t
+    call_price = s * np.exp(-q * t) * norm.cdf(d1) - k * np.exp(-r * t) * norm.cdf(d2)
+    call_price = np.where(sigma < 1e-10, np.maximum(s - k, 0.0) * np.exp(-r * t), call_price)
+    return call_price
 
 def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
-    log_function_start("implied_volatility_call")
     if price <= 0 or np.isnan(price):
-        log_function_end("implied_volatility_call")
         return np.nan
     if option_type == 'call':
         def objective(sigma):
@@ -33,10 +38,8 @@ def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
             return model_price - price
         try:
             iv = brentq(objective, 0.001, 20.0, maxiter=500)
-            log_function_end("implied_volatility_call")
             return iv
         except ValueError as e:
-            log_function_end("implied_volatility_call")
             get_logger("implied_volatility_call").warning(f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}: {e}")
             iv = 0.001
             return iv
@@ -364,6 +367,7 @@ def main(cfg: Optional[DictConfig] = None):
 
     maturities = np.load(maturities_path)
     initial_params = np.array([1.0, 0.1, -0.5])  # Initial guess for [eta, hurst, rho]
+    logger.info(f"Initial parameters: {initial_params}")
 
     logger.info("Pricing options...")
     option_prices = rbergomi_model.price_options(
@@ -403,7 +407,6 @@ def main(cfg: Optional[DictConfig] = None):
     calibration_result.plot_fit_quality()
 
     logger.info("Rough Bergomi model calculation completed.")
-
 
 if __name__ == "__main__":
     main()
