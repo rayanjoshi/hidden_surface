@@ -1,3 +1,20 @@
+"""
+Rough Bergomi model implementation for option pricing and calibration.
+
+This module provides functionality for simulating stock price paths using the
+Rough Bergomi model, pricing options, and calibrating model parameters to market
+data. It includes numerical methods for stochastic volatility modeling and
+supports parallel computation with Numba.
+
+Dependencies:
+    - numpy
+    - pandas
+    - scipy
+    - numba
+    - matplotlib
+    - hydra
+    - omegaconf
+"""
 from typing import Optional
 from pathlib import Path
 import numpy as np
@@ -14,6 +31,20 @@ import matplotlib.pyplot as plt
 from scripts.logging_config import get_logger, setup_logging
 
 def black_scholes_call(s, k, t, r=0, q=0, sigma = 0.2):
+    """
+    Calculate the Black-Scholes call option price.
+
+    Args:
+        s: Current stock price(s).
+        k: Strike price(s).
+        t: Time to maturity in years.
+        r: Risk-free rate (default: 0.0).
+        q: Dividend yield (default: 0.0).
+        sigma: Volatility (default: 0.2).
+
+    Returns:
+        Array of call option prices.
+    """
     s = np.asarray(s)
     k = np.asarray(k)
     t = np.asarray(t)
@@ -30,6 +61,21 @@ def black_scholes_call(s, k, t, r=0, q=0, sigma = 0.2):
     return call_price
 
 def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
+    """
+    Compute implied volatility for a call option using Black-Scholes.
+
+    Args:
+        price: Observed option price.
+        s: Current stock price.
+        k: Strike price.
+        t: Time to maturity in years.
+        r: Risk-free rate (default: 0.0).
+        q: Dividend yield (default: 0.0).
+        option_type: Option type, currently only 'call' is supported (default: 'call').
+
+    Returns:
+        Implied volatility or np.nan if computation fails.
+    """
     if price <= 0 or np.isnan(price):
         return np.nan
     if option_type == 'call':
@@ -40,12 +86,25 @@ def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
             iv = brentq(objective, 0.0001, 20.0, maxiter=500)
             return iv
         except ValueError as e:
-            get_logger("implied_volatility_call").warning(f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}: {e}")
+            msg = (
+                f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}: {e}"
+            )
+            get_logger("implied_volatility_call").warning(msg)
             iv = np.nan
             return iv
 
 @njit
 def get_power_law_coefficients(alpha, steps):
+    """
+    Calculate power-law coefficients for the Rough Bergomi kernel.
+
+    Args:
+        alpha: Roughness parameter (H - 0.5 where H is Hurst exponent).
+        steps: Number of time steps.
+
+    Returns:
+        Array of power-law coefficients.
+    """
     coefficients = np.zeros(steps)
     eps = 1e-10
 
@@ -59,6 +118,17 @@ def get_power_law_coefficients(alpha, steps):
 
 @njit
 def get_kernel_values(alpha, steps, time_step):
+    """
+    Compute kernel values for the Rough Bergomi model.
+
+    Args:
+        alpha: Roughness parameter (H - 0.5 where H is Hurst exponent).
+        steps: Number of time steps.
+        time_step: Size of each time step.
+
+    Returns:
+        Array of kernel values.
+    """
     coefficients = get_power_law_coefficients(alpha, steps)
     kernel = np.zeros(steps)
     eps = 1e-10
@@ -70,16 +140,44 @@ def get_kernel_values(alpha, steps, time_step):
 
 @njit
 def create_toeplitz(kernel):
+    """
+    Create a Toeplitz matrix from kernel values.
+
+    Args:
+        kernel: Array of kernel values.
+
+    Returns:
+        Toeplitz matrix.
+    """
     n = len(kernel)
-    T = np.zeros((n, n))
+    toeplitz = np.zeros((n, n))
     for j in range(n):
         for i in range(j, n):
-            T[i, j] = kernel[i - j]
-    return T
+            toeplitz[i, j] = kernel[i - j]
+    return toeplitz
 
 @njit(parallel=True)
 def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
                             rho, f_variance, all_g1, all_z, all_g2, short_rates):
+    """
+    Simulate stock and variance paths using the Rough Bergomi model.
+
+    Args:
+        n_paths: Number of simulation paths.
+        n_steps: Number of time steps.
+        maturity: Time to maturity in years.
+        eta: Volatility of variance.
+        hurst: Hurst exponent.
+        rho: Correlation between stock and variance processes.
+        f_variance: Forward variance curve.
+        all_g1: Random increments for variance process.
+        all_z: Random increments for stock process.
+        all_g2: Additional random increments for variance convolution.
+        short_rates: Short rates for each time step.
+
+    Returns:
+        Tuple of (stock paths, variance paths).
+    """
     alpha = hurst - 0.5
     alpha = max(alpha, -0.45)
     dt = maturity / n_steps
@@ -127,7 +225,9 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
     short_rates_tile = np.zeros((n_paths, n_steps))
     for p in prange(n_paths): # pylint: disable=not-an-iterable
         short_rates_tile[p, :] = short_rates[:-1]
-    d_log_s = (short_rates_tile - 0.5 * variance_paths[:, :-1]) * dt + sqrt_variance * delta_ws[:, 1:]
+    drift = (short_rates_tile - 0.5 * variance_paths[:, :-1]) * dt
+    diffusion = sqrt_variance * delta_ws[:, 1:]
+    d_log_s = drift + diffusion
     log_s_cum = np.zeros_like(d_log_s)
     for p in prange(n_paths): # pylint: disable=not-an-iterable
         log_s_cum[p] = np.cumsum(d_log_s[p])
@@ -136,6 +236,21 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
     return s_paths, variance_paths
 
 class RoughBergomiEngine:
+    """
+    Engine for pricing options and calibrating the Rough Bergomi model.
+
+    Attributes:
+        cfg: Configuration object containing file paths and model parameters.
+        logger: Logger instance for tracking operations.
+        df: DataFrame containing forward variance data.
+        forward_variance_func: Interpolation function for forward variance.
+        iv_surface: Implied volatility surface data.
+        maturities: Array of option maturities.
+        log_moneyness: Array of log moneyness values.
+        strikes: Array of strike prices.
+        risk_free_rate: Array of risk-free rates.
+        yield_spl: Spline interpolation for risk-free rates.
+    """
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
@@ -161,7 +276,8 @@ class RoughBergomiEngine:
         if np.any(np.isnan(self.log_moneyness)):
             raise ValueError("Log moneyness contain NaN values")
         self.strikes = np.exp(self.log_moneyness)
-        self.risk_free_rate_path = Path(repo_root / self.cfg.iv_surface.risk_free_rate_path).resolve()
+        rf_path = self.cfg.iv_surface.risk_free_rate_path
+        self.risk_free_rate_path = Path(repo_root / rf_path).resolve()
         self.risk_free_rate = np.load(self.risk_free_rate_path)
 
         if np.any(np.isnan(self.maturities)) or np.any(self.maturities <= 0):
@@ -172,33 +288,69 @@ class RoughBergomiEngine:
             self.maturities = np.insert(self.maturities, 0, 0)
             risk_free_rates = np.insert(self.risk_free_rate, 0, self.risk_free_rate[0])
         self.yield_spl = splrep(self.maturities, risk_free_rates, s=0, k=3)
-        
+
         if self.df["maturity_years"].isnull().any() or self.df["forward_variance"].isnull().any():
             raise ValueError("Forward variance data contains NaN values")
         if (self.df["forward_variance"] <= 0).any():
             raise ValueError("Forward variance contains non-positive values")
 
-        self.logger.info(f"Forward variance data range: {min(self.df['maturity_years'])} to {max(self.df['maturity_years'])}")
+        start = self.df["maturity_years"].min()
+        end = self.df["maturity_years"].max()
+        self.logger.info("Forward variance data range: %s to %s", start, end)
 
 
     def get_yield(self, t):
+        """
+        Interpolate yield curve at a given time.
+
+        Args:
+            t: Time point for yield interpolation.
+
+        Returns:
+            Interpolated yield value.
+        """
         return splev(t, self.yield_spl, ext=0)
 
     def get_short_rate(self, t):
+        """
+        Compute short rate using yield curve and its derivative.
+
+        Args:
+            t: Time point(s) for short rate calculation.
+
+        Returns:
+            Short rate(s) at the specified time(s).
+        """
         if np.isscalar(t):
             if t <= 0:
                 t = 1e-6
-            R = splev(t, self.yield_spl, ext=0)
-            dRdt = splev(t, self.yield_spl, der=1, ext=0)
-            return R + t * dRdt
-        else:
-            t = np.maximum(t, 1e-6)
-            R = splev(t, self.yield_spl, ext=0)
-            dRdt = splev(t, self.yield_spl, der=1, ext=0)
-            return R + t * dRdt
+            rate = splev(t, self.yield_spl, ext=0)
+            d_rate_dt = splev(t, self.yield_spl, der=1, ext=0)
+            return rate + t * d_rate_dt
+        t = np.maximum(t, 1e-6)
+        rate = splev(t, self.yield_spl, ext=0)
+        d_rate_dt = splev(t, self.yield_spl, der=1, ext=0)
+        return rate + t * d_rate_dt
 
     def price_options(self, strikes, maturities, params,
-                  n_paths=50000, n_steps=512, return_iv=False):
+                    n_paths=50000, n_steps=512, return_iv=False):
+        """
+        Price options using the Rough Bergomi model.
+
+        Args:
+            strikes: Array of strike prices.
+            maturities: Array of maturities.
+            params: Model parameters [eta, hurst, rho].
+            n_paths: Number of simulation paths (default: 50000).
+            n_steps: Number of time steps (default: 512).
+            return_iv: If True, return implied volatilities instead of prices (default: False).
+
+        Returns:
+            Array of option prices or implied volatilities.
+
+        Raises:
+            ValueError: If stock or variance paths contain invalid values.
+        """
         eta, hurst, rho = params
         n_steps = 2048 if max(maturities) < 0.1 else n_steps
         max_t = max(maturities)
@@ -249,14 +401,37 @@ class RoughBergomiEngine:
                 r = yields[m]
                 for k, strike in enumerate(strikes):
                     if prices[m, k] <= 0 or np.isnan(prices[m, k]):
-                        self.logger.warning(f"Invalid price at maturity {maturity}, strike {strike}: {prices[m, k]}")
+                        self.logger.warning(
+                            "Invalid price at maturity %s, strike %s: %s",
+                            maturity,
+                            strike,
+                            prices[m, k],
+                        )
                         ivs[m, k] = np.nan
                     else:
-                        ivs[m, k] = implied_volatility_call(prices[m, k], 1.0, strike, maturity, r=r)
+                        ivs[m, k] = implied_volatility_call(
+                            prices[m, k],
+                            1.0,
+                            strike,
+                            maturity,
+                            r=r,
+                        )
             return ivs
         return prices
 
     def calibrate(self, target_prices, strikes, maturities, initial_params):
+        """
+        Calibrate the Rough Bergomi model to market prices.
+
+        Args:
+            target_prices: Array of market option prices.
+            strikes: Array of strike prices.
+            maturities: Array of maturities.
+            initial_params: Initial guess for [eta, hurst, rho].
+
+        Returns:
+            CalibrationResult object containing optimal parameters and fit metrics.
+        """
         valid_indices = maturities >= 0.01
         filtered_maturities = maturities[valid_indices]
         filtered_target_prices = target_prices[valid_indices]
@@ -332,6 +507,17 @@ class RoughBergomiEngine:
 
 
 class CalibrationResult:
+    """
+    Stores and visualizes calibration results for the Rough Bergomi model.
+
+    Attributes:
+        optimal_params: Dictionary of calibrated parameters (eta, hurst, rho).
+        fitted_ivs: Array of fitted implied volatilities.
+        market_ivs: Array of market implied volatilities.
+        rmse: Root mean square error of the calibration.
+        convergence_info: Optimization results from least_squares.
+        simulation_stats: Placeholder for simulation statistics.
+    """
     def __init__(self):
         self.optimal_params = {}
         self.fitted_ivs = None
@@ -341,6 +527,9 @@ class CalibrationResult:
         self.simulation_stats = {}
 
     def plot_fit_quality(self):
+        """
+        Plot market vs. model implied volatilities.
+        """
         fig, ax = plt.subplots()
         _unused = fig
         ax.plot(self.market_ivs.flatten(), label='Market IV')
@@ -349,6 +538,12 @@ class CalibrationResult:
         plt.show()
 
     def generate_report(self):
+        """
+        Generate a text report of calibration results.
+
+        Returns:
+            String containing calibration parameters, RMSE, and convergence info.
+        """
         report_lines = [
             f"Optimal Params: {self.optimal_params}",
             f"RMSE: {self.rmse}",
