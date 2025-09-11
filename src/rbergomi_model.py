@@ -363,18 +363,18 @@ class RoughBergomiEngine:
             raise ValueError("Forward variance contains non-positive or NaN values")
         self.logger.info(f"Forward variance shape: {xi.shape}, values: {xi[:5]}...")
 
+        # Antithetic variates for variance reduction
         np.random.seed(42)
-        all_g1 = np.random.randn(n_paths // 2, n_steps)
-        all_g1 = np.vstack([all_g1, -all_g1])
-        all_z = np.random.randn(n_paths // 2, n_steps)
-        all_z = np.vstack([all_z, -all_z])
-        all_g2 = np.random.randn(n_paths // 2, n_steps)
-        all_g2 = np.vstack([all_g2, -all_g2])
+        n_base = n_paths // 2
 
-        if all_g1.shape[0] != n_paths:
-            all_g1 = all_g1[:n_paths, :]
-            all_z = all_z[:n_paths, :]
-            all_g2 = all_g2[:n_paths, :]
+        all_g1_base = np.random.randn(n_base, n_steps)
+        all_g1 = np.vstack([all_g1_base, -all_g1_base])[:n_paths, :]
+
+        all_z_base = np.random.randn(n_base, n_steps)
+        all_z = np.vstack([all_z_base, -all_z_base])[:n_paths, :]
+
+        all_g2_base = np.random.randn(n_base, n_steps)
+        all_g2 = np.vstack([all_g2_base, -all_g2_base])[:n_paths, :]
 
         s_paths, variance_paths = simulate_rbergomi_paths(n_paths, n_steps, max_t,
                                                         eta, hurst, rho, xi, all_g1, all_z,
@@ -438,6 +438,7 @@ class RoughBergomiEngine:
         filtered_strikes = strikes
         self.logger.info(f"Filtered to {len(filtered_maturities)} maturities >= 0.01")
         def objective(params):
+            eta, hurst, rho = params
             model_prices = self.price_options(filtered_strikes, filtered_maturities, params)
             if np.any(np.isnan(model_prices)) or np.any(model_prices <= 0):
                 self.logger.warning(f"Invalid model prices for params {params}: {model_prices}")
@@ -451,20 +452,32 @@ class RoughBergomiEngine:
             target_flat = filtered_target_prices[valid_mask]
             relative_errors = (model_flat - target_flat) / target_flat
 
-            penalty = 0.001 * np.sum([(p - ip)**2 for p, ip in zip(params, initial_params)])
-            penalty_scaled = penalty * np.sqrt(len(relative_errors))
-            return np.concatenate([relative_errors, np.array([penalty_scaled])])
+            reg_weight = 0.001
+            param_penalty = reg_weight * sum([
+                (eta - 1.0)**2,
+                10 * (hurst - 0.07)**2, 
+                (rho + 0.6)**2
+            ])
 
-        bounds = ([0.05, 0.005, -0.99], [2.0, 0.5, 0.99])
+            if len(relative_errors) > 2:
+                smoothness = 0.0001 * np.sum(np.diff(relative_errors, n=2)**2)
+            else:
+                smoothness = 0.0
+
+            total_penalty = param_penalty + smoothness
+
+            return np.concatenate([relative_errors, [total_penalty]])
+
+        bounds = ([0.01, 0.001, -0.95], [2.0, 0.49, 0.95])
         res = least_squares(
             objective,
             initial_params,
             bounds=bounds,
             method='trf',
             max_nfev=5000,
-            ftol=1e-8,
-            gtol=1e-8,
-            xtol=1e-8,
+            ftol=1e-10,
+            gtol=1e-10,
+            xtol=1e-10,
             loss='soft_l1',
             verbose=2
         )
@@ -574,7 +587,7 @@ def main(cfg: Optional[DictConfig] = None):
     maturities_path = Path(repo_root / cfg.iv_surface.maturities_path).resolve()
 
     maturities = np.load(maturities_path)
-    initial_params = np.array([1.0, 0.1, -0.5])  # Initial guess for [eta, hurst, rho]
+    initial_params = np.array([1.2, 0.07, -0.6])  # Initial guess for [eta, hurst, rho]
     logger.info(f"Initial parameters: {initial_params}")
 
     logger.info("Pricing options...")

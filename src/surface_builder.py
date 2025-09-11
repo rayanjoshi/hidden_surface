@@ -11,7 +11,7 @@ import hydra
 import pandas as pd
 import numpy as np
 from scipy.interpolate import griddata, interp1d
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, median_filter
 import matplotlib.pyplot as plt
 
 from scripts.logging_config import get_logger, setup_logging, log_function_start, log_function_end
@@ -52,6 +52,7 @@ class MarketSurfaceBuilder:
 
         self.raw_points = None
         self.iv_surface = None
+        self.maturities = None
 
     def load_data(self):
         """
@@ -79,6 +80,7 @@ class MarketSurfaceBuilder:
         self.logger.info("Moneyness range: [%f, %f]", k_min, k_max)
 
         self.grid_maturities = np.linspace(time_min, time_max, self.n_maturity_bins)
+        self.maturities = self.grid_maturities
         self.grid_log_moneyness = np.linspace(k_min, k_max, self.n_moneyness_bins)
         self.logger.info("Created market grid with %d maturities and %d moneyness levels",
                             self.n_maturity_bins, self.n_moneyness_bins)
@@ -158,17 +160,21 @@ class MarketSurfaceBuilder:
         total_variance_grid = gaussian_filter(total_variance_grid, sigma=0.5, mode='nearest')
         self.logger.info("Performed griddata interpolation for total variance")
 
-        for col_idx in range(total_variance_grid.shape[1]):
-            var_slice = total_variance_grid[:, col_idx].copy()
-            valid_mask = ~np.isnan(var_slice)
-            if valid_mask.sum() > 1:
-                for row_idx in range(1, len(var_slice)):
-                    if (valid_mask[row_idx] and valid_mask[row_idx - 1]
-                            and var_slice[row_idx] < var_slice[row_idx - 1]):
-                        var_slice[row_idx] = var_slice[row_idx - 1]
-            total_variance_grid[:, col_idx] = var_slice
+        tv = total_variance_grid.copy()
+        tv = np.nan_to_num(tv, nan=0.0)  # replace NaNs with zero variance
+        maturities_safe = np.maximum(self.maturities, 1e-8)  # avoid division by zero
+        iv_initial = np.sqrt(tv / maturities_safe[:, np.newaxis])
+        iv_clean = np.clip(iv_initial, 0.08, 2.0)   # Remove extremes
+        iv_clean = median_filter(iv_clean, size=(3, 3))  # Remove spikes
+        iv_clean = gaussian_filter(iv_clean, sigma=0.5)  # Smooth
 
-        self.iv_surface = np.sqrt(total_variance_grid / time_grid)
+        # Enforce arbitrage constraints on total variance
+        total_variance = iv_clean**2 * maturities_safe[:, np.newaxis]
+        for k in range(total_variance.shape[1]):
+            for t in range(1, total_variance.shape[0]):
+                total_variance[t, k] = max(total_variance[t, k], total_variance[t-1, k] + 0.001)
+
+        self.iv_surface = np.sqrt(total_variance / maturities_safe[:, np.newaxis])
         self.logger.info("Interpolated implied volatility surface on the market grid")
 
         log_function_end("interpolate_surface")
