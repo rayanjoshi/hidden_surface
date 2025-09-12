@@ -127,13 +127,11 @@ class ForwardVarianceCalculator:
         log_function_end("carr_madan_forward_variance")
 
     def _variance_swap_rate(self, df, forward_price, maturity):
-        log_function_start("_variance_swap_rate")
 
         calls = df[df["cp_flag"] == "C"].copy()
         puts = df[df["cp_flag"] == "P"].copy()
 
-        if len(calls) == 0 or len(puts) == 0:
-            log_function_end("_variance_swap_rate")
+        if len(calls) == 0 and len(puts) == 0:
             return 0.0
 
         calls = calls.sort_values(by="strike_price")
@@ -156,7 +154,7 @@ class ForwardVarianceCalculator:
             prices = otm_calls["mid"].to_numpy()
             integrand = prices / strikes**2
             if len(strikes) > 1:
-                var_contribution += np.trapz(integrand, strikes)
+                var_contribution += np.trapezoid(integrand, strikes)
             else:
                 var_contribution += integrand[0] * (strikes[0] * 0.01)  # Approx dK as 1% of K
 
@@ -166,7 +164,7 @@ class ForwardVarianceCalculator:
             prices = otm_puts["mid"].to_numpy()
             integrand = prices / strikes**2
             if len(strikes) > 1:
-                var_contribution += np.trapz(integrand, strikes)
+                var_contribution += np.trapezoid(integrand, strikes)
             else:
                 var_contribution += integrand[0] * (strikes[0] * 0.01)  # Approx
 
@@ -180,7 +178,6 @@ class ForwardVarianceCalculator:
         r = df["risk_free_rate"].iloc[0]
         theta = (2 * np.exp(r * maturity) * var_contribution) / maturity
 
-        log_function_end("_variance_swap_rate")
         return max(theta, 0.0)
 
     def _atm_approx(self, df, maturity):
