@@ -5,10 +5,13 @@ defaults:
 data_processor:
   output_path: data/processed/processed_data.csv
 
-  min_iv: 0.005
-  max_iv: 3.0
+  min_iv: 0.1
+  max_iv: 2.5
   moneyness_min: 0.5
   moneyness_max: 1.5
-  min_open_interest: 100.0
+  min_open_interest: 5
+  min_ttm: 0.00274  # ~1 day
+  max_bid_ask_spread: 0.3
+  iv_outlier_z_threshold: 3.0
   dividend_yield: 0.0
-  days_in_year: 365.0
+  days_in_year: 365

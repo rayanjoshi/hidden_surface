@@ -49,50 +49,81 @@ class DataProcessor:
         df = pd.read_csv(self.input_path)
         self.logger.info("Loaded data with %d rows and %d columns", df.shape[0], df.shape[1])
         df.dropna(inplace=True)
-        df.drop(['secid', 'optionid'], axis=1, inplace=True)
-        self.logger.info("Dropped the following columns: ['secid', 'optionid']")
+        df.drop(['secid', 'optionid'], axis=1, inplace=True, errors='ignore')
+        self.logger.info("Dropped unnecessary columns (if present)")
 
+        # Config params (add these to your config.yaml)
         min_iv = self.cfg.data_processor.min_iv
-        max_iv = self.cfg.data_processor.max_iv
+        max_iv = self.cfg.data_processor.get('max_iv', 2.0)
         moneyness_min = self.cfg.data_processor.moneyness_min
         moneyness_max = self.cfg.data_processor.moneyness_max
-        min_open_interest = self.cfg.data_processor.min_open_interest
+        min_open_interest = self.cfg.data_processor.get('min_open_interest', 10)
+        min_ttm = self.cfg.data_processor.get('min_ttm', 7 / 365.0)
+        max_bid_ask_spread = self.cfg.data_processor.get('max_bid_ask_spread', 0.2)
+        iv_outlier_z_threshold = self.cfg.data_processor.get('iv_outlier_z_threshold', 2.5)
         r = df['risk_free_rate']
         q = self.cfg.data_processor.dividend_yield
         days_in_year = self.cfg.data_processor.days_in_year
 
-        numeric_cols = [c for c in ['best_bid',
-                                    'best_offer',
-                                    'mid_quote',
-                                    'volume',
-                                    'implied_volatility',
-                                    'strike_price',
-                                    'open_interest',
-                                    'underlying_close',
-                                    'time_to_expiration'] if c in df.columns]
+        numeric_cols = [c for c in ['best_bid', 'best_offer', 'mid_quote',
+                                    'volume', 'implied_volatility',
+                                    'strike_price', 'open_interest',
+                                    'underlying_close', 'time_to_expiration',
+                                    ]
+                        if c in df.columns]
         for c in numeric_cols:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-        essential = ['strike_price', 'underlying_close', 'expiration']
+        essential = ['strike_price', 'underlying_close', 'expiration', 'cp_flag', 'date']
         for c in essential:
             if c not in df.columns:
                 raise KeyError(f"Required column '{c}' not found in input data")
 
+        df['date'] = pd.to_datetime(df['date'])
+        df['expiration'] = pd.to_datetime(df['expiration'])
+
+        # Liquidity filters
         if 'best_bid' in df.columns and 'best_offer' in df.columns:
             df = df[(df['best_bid'] > 0) & (df['best_offer'] > 0)]
+            df['bid_ask_spread'] = (
+                (df['best_offer'] - df['best_bid']) /
+                ((df['best_bid'] + df['best_offer']) / 2)
+            )
+            df = df[df['bid_ask_spread'] <= max_bid_ask_spread]
+            removed_rows = len(df) - len(df[df['bid_ask_spread'] <= max_bid_ask_spread])
+            self.logger.info(
+                "Filtered on relative bid-ask spread <= %.2f (removed %d rows)",
+                max_bid_ask_spread, removed_rows
+            )
 
         if 'volume' in df.columns:
             df = df[df['volume'] > 0]
 
+        if 'open_interest' in df.columns:
+            df = df[df['open_interest'] >= min_open_interest]
+            self.logger.info("Filtered on per-option open interest >= %d", min_open_interest)
+
+        # IV filtering (no normalization needed; data is in decimals)
         if 'implied_volatility' in df.columns:
-            iv = df['implied_volatility'].dropna()
-
-            if not iv.empty and iv.max() > 10:
-                df['implied_volatility'] = df['implied_volatility'] / 100.0
-
             df = df[(df['implied_volatility'] >= min_iv) & (df['implied_volatility'] <= max_iv)]
+            self.logger.info("Filtered IV between %.2f and %.2f", min_iv, max_iv)
 
+            # Per-date, per-expiration IV outlier removal
+            def remove_iv_outliers(group):
+                if len(group) < 3:
+                    return group
+                mean_iv = group['implied_volatility'].mean()
+                std_iv = group['implied_volatility'].std()
+                if std_iv == 0:
+                    return group
+                z_scores = (group['implied_volatility'] - mean_iv) / std_iv
+                return group[np.abs(z_scores) <= iv_outlier_z_threshold]
 
+            df = df.groupby(['date', 'expiration']).apply(remove_iv_outliers).reset_index(drop=True)
+            self.logger.info("Removed IV outliers (z-score threshold: %.1f)",
+                                iv_outlier_z_threshold)
+
+        # Calculate mid price
         if 'best_bid' in df.columns and 'best_offer' in df.columns:
             df['mid'] = (df['best_bid'] + df['best_offer']) / 2.0
         elif 'mid_quote' in df.columns:
@@ -101,48 +132,125 @@ class DataProcessor:
             df['mid'] = np.nan
         self.logger.info("Calculated 'mid' prices")
 
-
+        # Calculate T_years
         if 'time_to_expiration' in df.columns and df['time_to_expiration'].notna().any():
-
             df['T_years'] = df['time_to_expiration'].astype(float)
         else:
-
-            if 'date' in df.columns and 'expiration' in df.columns:
-                try:
-                    dates = pd.to_datetime(df['date'])
-                    exps = pd.to_datetime(df['expiration'])
-                    df['T_years'] = (exps - dates).dt.days.astype(float) / days_in_year
-                except (ValueError, TypeError, OverflowError, pd.errors.OutOfBoundsDatetime):
-                    df['T_years'] = 0.0
-            else:
+            try:
+                df['T_years'] = (df['expiration'] - df['date']).dt.days.astype(float) / days_in_year
+            except (ValueError, TypeError, OverflowError, pd.errors.OutOfBoundsDatetime):
                 df['T_years'] = 0.0
-        self.logger.info("Calculated 'T_years'")
-
-
         df['T_years'] = df['T_years'].clip(lower=1e-6)
-        self.logger.info("Clipped 'T_years' to avoid zero or negative values")
+        df = df[df['T_years'] >= min_ttm]
+        self.logger.info("Filtered T_years >= %.4f (min_ttm)", min_ttm)
 
-
+        # Moneyness filter
         underlying = df['underlying_close'].astype(float)
         strike = df['strike_price'].astype(float)
         df['moneyness'] = strike / underlying
         df = df[(df['moneyness'] >= moneyness_min) & (df['moneyness'] <= moneyness_max)]
-        self.logger.info("Filtered data based on moneyness between %.2f and %.2f",
-                            moneyness_min, moneyness_max)
+        self.logger.info(
+            "Filtered data based on moneyness between %.2f and %.2f",
+            moneyness_min, moneyness_max
+        )
 
+        # Forward and log moneyness
         df['forward'] = underlying * np.exp((r - q) * df['T_years'])
         self.logger.info("Calculated 'forward' prices")
-
         df['log_moneyness'] = np.log(strike / df['forward'].clip(lower=1e-12))
         self.logger.info("Calculated 'log_moneyness'")
 
+        # No-arbitrage price bounds for calls
+        if 'cp_flag' in df.columns and 'mid' in df.columns:
+            # Reassign variables after filtering to match the current DataFrame
+            underlying = df['underlying_close'].astype(float)
+            strike = df['strike_price'].astype(float)
+            r = df['risk_free_rate'].astype(float)
+            exp_qt = np.exp(-q * df['T_years'])
+            exp_rt = np.exp(-r * df['T_years'])
+            intrinsic = np.where(
+                df['cp_flag'] == 'C',
+                np.maximum(0, underlying * exp_qt - strike * exp_rt),
+                np.maximum(0, strike * exp_rt - underlying * exp_qt)
+            )
+            pre_count = len(df)
+            df = df[df['mid'] >= intrinsic]
+            self.logger.info(
+                "Applied no-arbitrage bounds (removed %d violations)",
+                pre_count - len(df)
+            )
+
+        # Convexity check for calls and puts
+        if 'cp_flag' in df.columns:
+            def check_convexity_calls(group):
+                if len(group) < 3 or not all(group['cp_flag'] == 'C'):
+                    return group
+                group = group.sort_values('strike_price')
+                prices = group['mid'].values
+                # For calls, price should decrease with increasing strike
+                valid = (prices[:-1] >= prices[1:]).all()
+                if not valid:
+                    self.logger.warning(
+                        "Convexity violation detected in call group: %s",
+                        group['expiration'].iloc[0]
+                    )
+                    # Keep only the middle 50% of strikes to avoid extreme violations
+                    mid_idx = range(len(group)//4, 3*len(group)//4)
+                    return group.iloc[mid_idx]
+                return group
+
+            def check_convexity_puts(group):
+                if len(group) < 3 or not all(group['cp_flag'] == 'P'):
+                    return group
+                group = group.sort_values('strike_price')
+                prices = group['mid'].values
+                # For puts, price should increase with increasing strike
+                valid = (prices[:-1] <= prices[1:]).all()
+                if not valid:
+                    self.logger.warning("Convexity violation detected in put group: %s",
+                                        group[['expiration']].iloc[0])
+                    # Keep only the middle 50% of strikes to avoid extreme violations
+                    mid_idx = range(len(group)//4, 3*len(group)//4)
+                    return group.iloc[mid_idx]
+                return group
+
+            df_calls = (
+                df[df['cp_flag'] == 'C']
+                .groupby('expiration')
+                .apply(check_convexity_calls)
+                .reset_index(drop=True)
+            )
+            df_puts = (
+                df[df['cp_flag'] == 'P']
+                .groupby('expiration')
+                .apply(check_convexity_puts)
+                .reset_index(drop=True)
+            )
+            df = pd.concat([df_calls, df_puts], ignore_index=True)
+            self.logger.info("Applied convexity check for calls and puts")
+
+        # Expiration-level open interest filter
         if 'open_interest' in df.columns:
             oi_by_exp = df.groupby('expiration')['open_interest'].sum()
             valid_exps = oi_by_exp[oi_by_exp >= min_open_interest].index
             df = df[df['expiration'].isin(valid_exps)]
+            self.logger.info(
+                "Filtered expirations with total open interest >= %d",
+                min_open_interest
+            )
 
         df.dropna(subset=['mid', 'moneyness', 'T_years', 'log_moneyness'], inplace=True)
         self.logger.info("Processed data now has %d rows and %d columns", df.shape[0], df.shape[1])
+
+        # Log IV stats per expiration for debugging
+        if 'implied_volatility' in df.columns:
+            iv_stats = df.groupby('expiration')['implied_volatility'].describe()
+            for exp in iv_stats.index:
+                stats = iv_stats.loc[exp]
+                self.logger.debug(
+                    "IV stats for expiration %s: min=%.2f, max=%.2f, mean=%.2f, std=%.2f",
+                    exp, stats['min'], stats['max'], stats['mean'], stats['std']
+                )
 
         log_function_end("process_data")
         return df
