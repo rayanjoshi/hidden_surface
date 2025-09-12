@@ -6,3 +6,6 @@ iv_surface:
   maturities_path: "data/iv_surface/grid_maturities.npy"
   log_moneyness_path: "data/iv_surface/grid_log_moneyness.npy"
   risk_free_rate_path: "data/iv_surface/grid_risk_free_rates.npy"
+
+rbergomi:
+  save_path: "data/rbergomi_model"

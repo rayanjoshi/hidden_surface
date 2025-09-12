@@ -455,7 +455,7 @@ class RoughBergomiEngine:
             reg_weight = 0.001
             param_penalty = reg_weight * sum([
                 (eta - 1.0)**2,
-                10 * (hurst - 0.07)**2, 
+                10 * (hurst - 0.07)**2,
                 (rho + 0.6)**2
             ])
 
@@ -497,7 +497,7 @@ class RoughBergomiEngine:
                         fitted_prices[m, k], 1.0, strike, maturity, r=r
                     )
 
-        result = CalibrationResult()
+        result = CalibrationResult(self.cfg)
         result.optimal_params = {
             'eta': optimal_params[0],
             'hurst': optimal_params[1],
@@ -531,13 +531,17 @@ class CalibrationResult:
         convergence_info: Optimization results from least_squares.
         simulation_stats: Placeholder for simulation statistics.
     """
-    def __init__(self):
+    def __init__(self, cfg: DictConfig):
+        self.cfg = cfg
         self.optimal_params = {}
         self.fitted_ivs = None
         self.market_ivs = None
         self.rmse = 0.0
         self.convergence_info = {}
         self.simulation_stats = {}
+        script_dir = Path(__file__).parent
+        repo_root = script_dir.parent
+        self.save_path = Path(repo_root / self.cfg.rbergomi.save_path).resolve()
 
     def plot_fit_quality(self):
         """
@@ -548,7 +552,12 @@ class CalibrationResult:
         ax.plot(self.market_ivs.flatten(), label='Market IV')
         ax.plot(self.fitted_ivs.flatten(), label='Model IV')
         ax.legend()
-        plt.show()
+        ax.set_title('Market vs Model Implied Volatilities')
+        ax.set_xlabel('Steps')
+        ax.set_ylabel('Implied Volatility')
+        self.save_path.mkdir(parents=True, exist_ok=True)
+        self.save_path = self.save_path / "market_vs_model_iv.png"
+        plt.savefig( self.save_path)
 
     def generate_report(self):
         """
@@ -626,6 +635,7 @@ def main(cfg: Optional[DictConfig] = None):
 
     logger.info("Plotting fit quality...")
     calibration_result.plot_fit_quality()
+    logger.info(f"Plots saved to {calibration_result.save_path}")
 
     logger.info("Rough Bergomi model calculation completed.")
 
