@@ -49,8 +49,9 @@ class DataProcessor:
         df = pd.read_csv(self.input_path)
         self.logger.info("Loaded data with %d rows and %d columns", df.shape[0], df.shape[1])
         df.dropna(inplace=True)
+        self.logger.info("Dropped rows with NaN values; remaining rows: %d", len(df))
         df.drop(['secid', 'optionid'], axis=1, inplace=True, errors='ignore')
-        self.logger.info("Dropped unnecessary columns (if present)")
+        self.logger.info("Dropped unnecessary columns")
 
         # Config params (add these to your config.yaml)
         min_iv = self.cfg.data_processor.min_iv
@@ -74,7 +75,7 @@ class DataProcessor:
         for c in numeric_cols:
             df[c] = pd.to_numeric(df[c], errors='coerce')
 
-        essential = ['strike_price', 'underlying_close', 'expiration', 'cp_flag', 'date']
+        essential = ['strike_price', 'underlying_close', 'expiration', 'cp_flag', 'date', 'risk_free_rate']
         for c in essential:
             if c not in df.columns:
                 raise KeyError(f"Required column '{c}' not found in input data")
@@ -119,7 +120,9 @@ class DataProcessor:
                 z_scores = (group['implied_volatility'] - mean_iv) / std_iv
                 return group[np.abs(z_scores) <= iv_outlier_z_threshold]
 
-            df = df.groupby(['date', 'expiration']).apply(remove_iv_outliers).reset_index(drop=True)
+            df = df.groupby(['date', 'expiration'], group_keys=False).apply(
+                            remove_iv_outliers, include_groups=True
+                            ).reset_index(drop=True)
             self.logger.info("Removed IV outliers (z-score threshold: %.1f)",
                                 iv_outlier_z_threshold)
 
@@ -182,52 +185,76 @@ class DataProcessor:
 
         # Convexity check for calls and puts
         if 'cp_flag' in df.columns:
-            def check_convexity_calls(group):
-                if len(group) < 3 or not all(group['cp_flag'] == 'C'):
-                    return group
+            def check_monotonicity_and_convexity_calls(group):
                 group = group.sort_values('strike_price')
                 prices = group['mid'].values
-                # For calls, price should decrease with increasing strike
-                valid = (prices[:-1] >= prices[1:]).all()
-                if not valid:
+                # Monotonicity check: Call prices should be non-increasing
+                if not (prices[:-1] >= prices[1:]).all():
                     self.logger.warning(
-                        "Convexity violation detected in call group: %s",
+                        "Monotonicity violation detected in call group: %s",
                         group['expiration'].iloc[0]
                     )
-                    # Keep only the middle 50% of strikes to avoid extreme violations
+                    # Keep middle 50% of strikes
                     mid_idx = range(len(group)//4, 3*len(group)//4)
                     return group.iloc[mid_idx]
+                # Convexity check: Second differences should be non-negative
+                if len(prices) >= 3:
+                    # Compute first differences: delta_price = price[i+1] - price[i]
+                    first_diffs = np.diff(prices)
+                    # Compute second differences: (price[i+2] - price[i+1]) - (price[i+1] - price[i])
+                    second_diffs = np.diff(first_diffs)
+                    if not (second_diffs >= 0).all():
+                        self.logger.warning(
+                            "Convexity violation detected in call group: %s",
+                            group['expiration'].iloc[0]
+                        )
+                        # Keep middle 50% of strikes
+                        mid_idx = range(len(group)//4, 3*len(group)//4)
+                        return group.iloc[mid_idx]
                 return group
 
-            def check_convexity_puts(group):
+            def check_monotonicity_and_convexity_puts(group):
                 if len(group) < 3 or not all(group['cp_flag'] == 'P'):
                     return group
                 group = group.sort_values('strike_price')
                 prices = group['mid'].values
-                # For puts, price should increase with increasing strike
-                valid = (prices[:-1] <= prices[1:]).all()
-                if not valid:
-                    self.logger.warning("Convexity violation detected in put group: %s",
-                                        group[['expiration']].iloc[0])
-                    # Keep only the middle 50% of strikes to avoid extreme violations
+                # Monotonicity check: Put prices should be non-decreasing
+                if not (prices[:-1] <= prices[1:]).all():
+                    self.logger.warning(
+                        "Monotonicity violation detected in put group: %s",
+                        group['expiration'].iloc[0]
+                    )
+                    # Keep middle 50% of strikes
                     mid_idx = range(len(group)//4, 3*len(group)//4)
                     return group.iloc[mid_idx]
+                # Convexity check: Second differences should be non-negative
+                if len(prices) >= 3:
+                    first_diffs = np.diff(prices)
+                    second_diffs = np.diff(first_diffs)
+                    if not (second_diffs >= 0).all():
+                        self.logger.warning(
+                            "Convexity violation detected in put group: %s",
+                            group['expiration'].iloc[0]
+                        )
+                        # Keep middle 50% of strikes
+                        mid_idx = range(len(group)//4, 3*len(group)//4)
+                        return group.iloc[mid_idx]
                 return group
 
             df_calls = (
                 df[df['cp_flag'] == 'C']
-                .groupby('expiration')
-                .apply(check_convexity_calls)
+                .groupby('expiration', group_keys=False)
+                .apply(check_monotonicity_and_convexity_calls, include_groups=True)
                 .reset_index(drop=True)
             )
             df_puts = (
                 df[df['cp_flag'] == 'P']
-                .groupby('expiration')
-                .apply(check_convexity_puts)
+                .groupby('expiration', group_keys=False)
+                .apply(check_monotonicity_and_convexity_puts, include_groups=True)
                 .reset_index(drop=True)
             )
             df = pd.concat([df_calls, df_puts], ignore_index=True)
-            self.logger.info("Applied convexity check for calls and puts")
+            self.logger.info("Applied monotonicity and convexity checks for calls and puts")
 
         # Expiration-level open interest filter
         if 'open_interest' in df.columns:
