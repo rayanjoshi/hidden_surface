@@ -19,6 +19,7 @@ from typing import Optional
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import json
 from scipy.stats import norm
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d, splev, splrep
@@ -60,7 +61,37 @@ def black_scholes_call(s, k, t, r=0, q=0, sigma = 0.2):
     call_price = np.where(sigma < 1e-10, np.maximum(s - k, 0.0) * np.exp(-r * t), call_price)
     return call_price
 
-def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
+def black_scholes_put(s, k, t, r=0, q=0, sigma=0.2):
+    """
+    Calculate the Black-Scholes put option price.
+
+    Args:
+        s: Current stock price(s).
+        k: Strike price(s).
+        t: Time to maturity in years.
+        r: Risk-free rate (default: 0.0).
+        q: Dividend yield (default: 0.0).
+        sigma: Volatility (default: 0.2).
+
+    Returns:
+        Array of put option prices.
+    """
+    s = np.asarray(s)
+    k = np.asarray(k)
+    t = np.asarray(t)
+    r = np.asarray(r) if not isinstance(r, float) else r
+    q = np.asarray(q) if not isinstance(q, float) else q
+    sigma = np.asarray(sigma) if not isinstance(sigma, float) else sigma
+
+    sigma = np.where(sigma < 1e-10, 1e-10, sigma)
+    sqrt_t = np.sqrt(t)
+    d1 = (np.log(s / k) + (r - q + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t + 1e-10)
+    d2 = d1 - sigma * sqrt_t
+    put_price = k * np.exp(-r * t) * norm.cdf(-d2) - s * np.exp(-q * t) * norm.cdf(-d1)
+    put_price = np.where(sigma < 1e-10, np.maximum(k - s, 0.0) * np.exp(-r * t), put_price)
+    return put_price
+
+def implied_volatility(price, s, k, t, r=0, q=0, option_type='call'):
     """
     Compute implied volatility for a call option using Black-Scholes.
 
@@ -78,20 +109,19 @@ def implied_volatility_call(price, s, k, t, r=0, q=0, option_type='call'):
     """
     if price <= 0 or np.isnan(price):
         return np.nan
-    if option_type == 'call':
-        def objective(sigma):
+    def objective(sigma):
+        if option_type == 'call':
             model_price = black_scholes_call(s, k, t, r, q, sigma)
-            return model_price - price
-        try:
-            iv = brentq(objective, 0.0001, 20.0, maxiter=500)
-            return iv
-        except ValueError as e:
-            msg = (
-                f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}: {e}"
-            )
-            get_logger("implied_volatility_call").warning(msg)
-            iv = np.nan
-            return iv
+        else:  # 'put'
+            model_price = black_scholes_put(s, k, t, r, q, sigma)
+        return model_price - price
+    try:
+        iv = brentq(objective, 0.0001, 20.0, maxiter=500)
+        return iv
+    except ValueError as e:
+        msg = f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}, type={option_type}: {e}"
+        get_logger("implied_volatility").warning(msg)
+        return np.nan
 
 @njit
 def get_power_law_coefficients(alpha, steps):
@@ -333,7 +363,7 @@ class RoughBergomiEngine:
         return rate + t * d_rate_dt
 
     def price_options(self, strikes, maturities, params,
-                    n_paths=50000, n_steps=512, return_iv=False):
+                    n_paths=50000, n_steps=512, return_iv=False, option_type='call'):
         """
         Price options using the Rough Bergomi model.
 
@@ -391,7 +421,10 @@ class RoughBergomiEngine:
         s_t_all = s_paths[:, indices]
         yields = self.get_yield(maturities)
         discounts = np.exp(-yields * maturities)
-        payoffs = np.maximum(s_t_all[:, :, None] - strikes[None, None, :], 0)
+        if option_type == 'call':
+            payoffs = np.maximum(s_t_all[:, :, None] - strikes[None, None, :], 0)
+        else:  # 'put'
+            payoffs = np.maximum(strikes[None, None, :] - s_t_all[:, :, None], 0)
         prices = np.mean(payoffs, axis=0) * discounts[:, None]
         prices = np.maximum(prices, 1e-12)
 
@@ -409,7 +442,7 @@ class RoughBergomiEngine:
                         )
                         ivs[m, k] = np.nan
                     else:
-                        ivs[m, k] = implied_volatility_call(
+                        ivs[m, k] = implied_volatility(
                             prices[m, k],
                             1.0,
                             strike,
@@ -419,12 +452,13 @@ class RoughBergomiEngine:
             return ivs
         return prices
 
-    def calibrate(self, target_prices, strikes, maturities, initial_params):
+    def calibrate(self, target_call_prices, target_put_prices, strikes, maturities, initial_params):
         """
         Calibrate the Rough Bergomi model to market prices.
 
         Args:
-            target_prices: Array of market option prices.
+            target_call_prices: Array of market call option prices.
+            target_put_prices: Array of market put option prices.
             strikes: Array of strike prices.
             maturities: Array of maturities.
             initial_params: Initial guess for [eta, hurst, rho].
@@ -434,23 +468,20 @@ class RoughBergomiEngine:
         """
         valid_indices = maturities >= 0.01
         filtered_maturities = maturities[valid_indices]
-        filtered_target_prices = target_prices[valid_indices]
+        filtered_call_prices = target_call_prices[valid_indices]
+        filtered_put_prices = target_put_prices[valid_indices]
         filtered_strikes = strikes
         self.logger.info(f"Filtered to {len(filtered_maturities)} maturities >= 0.01")
         def objective(params):
             eta, hurst, rho = params
-            model_prices = self.price_options(filtered_strikes, filtered_maturities, params)
-            if np.any(np.isnan(model_prices)) or np.any(model_prices <= 0):
-                self.logger.warning(f"Invalid model prices for params {params}: {model_prices}")
-                return np.full(filtered_target_prices.size, 1e6)
+            model_call_prices = self.price_options(filtered_strikes, filtered_maturities, params, option_type='call')
+            model_put_prices = self.price_options(filtered_strikes, filtered_maturities, params, option_type='put')
 
-            valid_mask = (filtered_target_prices > 0) & np.isfinite(filtered_target_prices)
-            if not np.any(valid_mask):
-                return np.full(filtered_target_prices.size, 1e6)
+            valid_call_mask = (filtered_call_prices > 0) & np.isfinite(filtered_call_prices)
+            valid_put_mask = (filtered_put_prices > 0) & np.isfinite(filtered_put_prices)
 
-            model_flat = model_prices[valid_mask]
-            target_flat = filtered_target_prices[valid_mask]
-            relative_errors = (model_flat - target_flat) / target_flat
+            call_errors = (model_call_prices[valid_call_mask] - filtered_call_prices[valid_call_mask]) / filtered_call_prices[valid_call_mask]
+            put_errors = (model_put_prices[valid_put_mask] - filtered_put_prices[valid_put_mask]) / filtered_put_prices[valid_put_mask]
 
             reg_weight = 0.001
             param_penalty = reg_weight * sum([
@@ -459,14 +490,15 @@ class RoughBergomiEngine:
                 (rho + 0.6)**2
             ])
 
-            if len(relative_errors) > 2:
-                smoothness = 0.0001 * np.sum(np.diff(relative_errors, n=2)**2)
+            all_errors = np.concatenate([call_errors, put_errors])
+            if len(all_errors) > 2:
+                smoothness = 0.0001 * np.sum(np.diff(all_errors, n=2)**2)
             else:
                 smoothness = 0.0
 
             total_penalty = param_penalty + smoothness
 
-            return np.concatenate([relative_errors, [total_penalty]])
+            return np.concatenate([all_errors, [total_penalty]])
 
         bounds = ([0.01, 0.001, -0.95], [2.0, 0.49, 0.95])
         res = least_squares(
@@ -484,18 +516,35 @@ class RoughBergomiEngine:
 
         optimal_params = res.x
 
-        # Compute fitted IVs
-        fitted_prices = self.price_options(filtered_strikes, filtered_maturities, optimal_params)
-        fitted_ivs = np.zeros(fitted_prices.shape)
+        # Compute fitted IVs (using both call and put prices for maximum consistency)
+        fitted_call_prices = self.price_options(filtered_strikes, filtered_maturities, optimal_params, option_type='call')
+        fitted_put_prices = self.price_options(filtered_strikes, filtered_maturities, optimal_params, option_type='put')
+        fitted_call_ivs = np.zeros(fitted_call_prices.shape)
+        fitted_put_ivs = np.zeros(fitted_put_prices.shape)
         for m, maturity in enumerate(filtered_maturities):
             r = self.get_yield(maturity)
             for k, strike in enumerate(strikes):
-                if fitted_prices[m, k] <= 0 or np.isnan(fitted_prices[m, k]):
-                    fitted_ivs[m, k] = np.nan
-                else:
-                    fitted_ivs[m, k] = implied_volatility_call(
-                        fitted_prices[m, k], 1.0, strike, maturity, r=r
+                # Compute IV from calls
+                if fitted_call_prices[m, k] > 0 and not np.isnan(fitted_call_prices[m, k]):
+                    fitted_call_ivs[m, k] = implied_volatility(
+                        fitted_call_prices[m, k], 1.0, strike, maturity, r=r, option_type='call'
                     )
+                else:
+                    fitted_call_ivs[m, k] = np.nan
+
+                # Compute IV from puts
+                if fitted_put_prices[m, k] > 0 and not np.isnan(fitted_put_prices[m, k]):
+                    fitted_put_ivs[m, k] = implied_volatility(
+                        fitted_put_prices[m, k], 1.0, strike, maturity, r=r, option_type='put'
+                    )
+                else:
+                    fitted_put_ivs[m, k] = np.nan
+
+        # Average the IVs from calls and puts (they should be identical due to put-call parity)
+        fitted_ivs = np.zeros_like(fitted_call_ivs)
+        valid_mask = np.isfinite(fitted_call_ivs) & np.isfinite(fitted_put_ivs)
+        fitted_ivs[valid_mask] = (fitted_call_ivs[valid_mask] + fitted_put_ivs[valid_mask]) / 2
+        fitted_ivs[~valid_mask] = np.where(np.isfinite(fitted_call_ivs[~valid_mask]), fitted_call_ivs[~valid_mask], fitted_put_ivs[~valid_mask])
 
         result = CalibrationResult(self.cfg)
         result.optimal_params = {
@@ -556,23 +605,70 @@ class CalibrationResult:
         ax.set_xlabel('Steps')
         ax.set_ylabel('Implied Volatility')
         self.save_path.mkdir(parents=True, exist_ok=True)
-        self.save_path = self.save_path / "market_vs_model_iv.png"
-        plt.savefig( self.save_path)
+        self.save_path = self.save_path / "market_vs_model_iv.svg"
+        plt.savefig( self.save_path, format='svg')
 
     def generate_report(self):
         """
-        Generate a text report of calibration results.
+        Generate a dictionary report of calibration results.
 
         Returns:
-            String containing calibration parameters, RMSE, and convergence info.
+            Dictionary containing calibration parameters, RMSE, and convergence info.
         """
-        report_lines = [
-            f"Optimal Params: {self.optimal_params}",
-            f"RMSE: {self.rmse}",
-            f"Convergence: {self.convergence_info}",
-        ]
-        report = "\n".join(report_lines)
-        return report
+        convergence = self.convergence_info
+
+        # Basic convergence fields
+        conv = {
+            "success": convergence.success,
+            "status": convergence.status,
+            "message": convergence.message,
+            "x": convergence.x.tolist(),
+            "cost": convergence.cost,
+            "grad": convergence.grad.tolist() if hasattr(convergence.grad, 'tolist') else list(convergence.grad),
+            "optimality": convergence.optimality,
+            "active_mask": convergence.active_mask.tolist() if hasattr(convergence.active_mask, 'tolist') else list(convergence.active_mask),
+            "nfev": convergence.nfev,
+            "njev": convergence.njev,
+        }
+        # Summarize fun and jac if available
+        try:
+            if hasattr(convergence, 'fun') and convergence.fun is not None:
+                fun = np.asarray(convergence.fun)
+                conv["fun_summary"] = {
+                    "count": int(fun.size),
+                    "mean": float(np.nanmean(fun)) if fun.size > 0 else None,
+                    "std": float(np.nanstd(fun)) if fun.size > 0 else None,
+                    "min": float(np.nanmin(fun)) if fun.size > 0 else None,
+                    "max": float(np.nanmax(fun)) if fun.size > 0 else None,
+                    "norm": float(np.linalg.norm(fun)) if fun.size > 0 else None,
+                    "sample_first_10": fun.flatten()[:10].tolist() if fun.size > 0 else [],
+                }
+        except (ValueError, TypeError, np.linalg.LinAlgError):
+            conv["fun_summary"] = None
+
+        try:
+            if hasattr(convergence, 'jac') and convergence.jac is not None:
+                jac = np.asarray(convergence.jac)
+                jac_shape = tuple(jac.shape)
+                jac_rank = int(np.linalg.matrix_rank(jac))
+                jac_cond = float(np.linalg.cond(jac)) if jac.size > 0 else None
+                s = np.linalg.svd(jac, compute_uv=False)
+                top_s = s[:10].tolist()
+
+                conv["jac_summary"] = {
+                    "shape": jac_shape,
+                    "rank": jac_rank,
+                    "cond": jac_cond,
+                    "top_singular_values": top_s,
+                }
+        except (ValueError, TypeError, np.linalg.LinAlgError):
+            conv["jac_summary"] = None
+
+        return {
+            "Optimal Params": self.optimal_params,
+            "RMSE": self.rmse,
+            "Convergence": conv,
+        }
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="rbergomi_model")
@@ -611,19 +707,25 @@ def main(cfg: Optional[DictConfig] = None):
     logger.info(f"Option prices:\n{option_prices}")
 
     logger.info("Calibrating model...")
-    market_prices = np.zeros_like(rbergomi_model.iv_surface)
+    target_call_prices = np.zeros_like(rbergomi_model.iv_surface)
+    target_put_prices = np.zeros_like(rbergomi_model.iv_surface)
     for m, maturity in enumerate(maturities):
         r = rbergomi_model.get_yield(maturity)
         for k, strike in enumerate(rbergomi_model.strikes):
             if np.isnan(rbergomi_model.iv_surface[m, k]) or rbergomi_model.iv_surface[m, k] <= 0:
-                market_prices[m, k] = np.nan
+                target_call_prices[m, k] = np.nan
+                target_put_prices[m, k] = np.nan
             else:
-                market_prices[m, k] = black_scholes_call(
-                    s=1.0, k=strike, t=maturity, r=r, q=0, sigma=rbergomi_model.iv_surface[m, k]
+                sigma = rbergomi_model.iv_surface[m, k]
+                target_call_prices[m, k] = black_scholes_call(
+                    s=1.0, k=strike, t=maturity, r=r, q=0, sigma=sigma
                 )
-    target_prices = market_prices
+                target_put_prices[m, k] = black_scholes_put(
+                    s=1.0, k=strike, t=maturity, r=r, q=0, sigma=sigma
+                )
     calibration_result = rbergomi_model.calibrate(
-        target_prices=target_prices,
+        target_call_prices=target_call_prices,
+        target_put_prices=target_put_prices,
         strikes=rbergomi_model.strikes,
         maturities=maturities,
         initial_params=initial_params
@@ -632,6 +734,11 @@ def main(cfg: Optional[DictConfig] = None):
     logger.info("Generating calibration report...")
     report = calibration_result.generate_report()
     logger.info(f"Calibration report:\n{report}")
+
+    report_file = calibration_result.save_path / "calibration_report.json"
+    with open(report_file, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=4, default=str)
+    logger.info(f"Calibration report saved to {report_file}")
 
     logger.info("Plotting fit quality...")
     calibration_result.plot_fit_quality()
