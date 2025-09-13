@@ -249,7 +249,7 @@ class ForwardVarianceCalculator:
         fig.suptitle("Forward Variance and Variance Swap Curves")
         fig.legend(loc="upper right")
         plt.tight_layout()
-        plt.savefig(self.output_path / "forward_variance.png")
+        plt.savefig(self.output_path / "forward_variance.svg", format='svg')
 
         log_function_end("plot_variance")
 

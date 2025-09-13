@@ -233,8 +233,9 @@ class MarketSurfaceBuilder:
         plt.colorbar(scatter, ax=axes[1])
 
         plt.tight_layout()
-        save_path = Path(self.output_dir / "iv_surface.png")
-        plt.savefig(save_path)
+        save_path = Path(self.output_dir / "iv_surface")
+        plt.savefig(save_path.with_suffix('.svg'), format='svg')
+        plt.savefig(save_path.with_suffix('.png'), format='png', dpi=300)
         self.logger.info("Saved plots to %s", save_path)
 
         log_function_end("plot_surface")
