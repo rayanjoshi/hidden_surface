@@ -48,8 +48,8 @@ class DataLoader:
         self.password = os.getenv("WRDS_PASSWORD")
         self.sql_query = self.cfg.data_loader.sql_query
         src_dir = Path(__file__).parent
-        self.sql_query_path = Path(src_dir / self.sql_query).resolve()
         repo_root = src_dir.parent
+        self.sql_query_path = Path(repo_root / self.sql_query).absolute()
         self.save_path = self.cfg.data_loader.output_path
         self.save_path = Path(repo_root / self.save_path).resolve()
 
