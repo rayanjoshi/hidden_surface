@@ -17,9 +17,9 @@ Dependencies:
 """
 from typing import Optional
 from pathlib import Path
+import json
 import numpy as np
 import pandas as pd
-import json
 from scipy.stats import norm
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d, splev, splrep
@@ -119,8 +119,10 @@ def implied_volatility(price, s, k, t, r=0, q=0, option_type='call'):
         iv = brentq(objective, 0.0001, 20.0, maxiter=500)
         return iv
     except ValueError as e:
-        msg = f"Failed to compute IV for price={price}, s={s}, k={k}, t={t}, type={option_type}: {e}"
-        get_logger("implied_volatility").warning(msg)
+        get_logger("implied_volatility").warning(
+            "Failed to compute IV for price=%s, s=%s, k=%s, t=%s, type=%s: %s",
+            price, s, k, t, option_type, e
+        )
         return np.nan
 
 @njit
@@ -474,14 +476,26 @@ class RoughBergomiEngine:
         self.logger.info(f"Filtered to {len(filtered_maturities)} maturities >= 0.01")
         def objective(params):
             eta, hurst, rho = params
-            model_call_prices = self.price_options(filtered_strikes, filtered_maturities, params, option_type='call')
-            model_put_prices = self.price_options(filtered_strikes, filtered_maturities, params, option_type='put')
+            model_call_prices = self.price_options(filtered_strikes,
+                                                    filtered_maturities,
+                                                    params,
+                                                    option_type='call',
+                                                    )
+            model_put_prices = self.price_options(filtered_strikes,
+                                                    filtered_maturities,
+                                                    params,
+                                                    option_type='put',
+                                                    )
 
             valid_call_mask = (filtered_call_prices > 0) & np.isfinite(filtered_call_prices)
             valid_put_mask = (filtered_put_prices > 0) & np.isfinite(filtered_put_prices)
 
-            call_errors = (model_call_prices[valid_call_mask] - filtered_call_prices[valid_call_mask]) / filtered_call_prices[valid_call_mask]
-            put_errors = (model_put_prices[valid_put_mask] - filtered_put_prices[valid_put_mask]) / filtered_put_prices[valid_put_mask]
+            call_errors = (
+                model_call_prices[valid_call_mask] - filtered_call_prices[valid_call_mask]
+            ) / filtered_call_prices[valid_call_mask]
+            put_errors = (
+                model_put_prices[valid_put_mask] - filtered_put_prices[valid_put_mask]
+            ) / filtered_put_prices[valid_put_mask]
 
             reg_weight = 0.001
             param_penalty = reg_weight * sum([
@@ -517,8 +531,16 @@ class RoughBergomiEngine:
         optimal_params = res.x
 
         # Compute fitted IVs (using both call and put prices for maximum consistency)
-        fitted_call_prices = self.price_options(filtered_strikes, filtered_maturities, optimal_params, option_type='call')
-        fitted_put_prices = self.price_options(filtered_strikes, filtered_maturities, optimal_params, option_type='put')
+        fitted_call_prices = self.price_options(filtered_strikes,
+                                                filtered_maturities,
+                                                optimal_params,
+                                                option_type='call',
+                                                )
+        fitted_put_prices = self.price_options(filtered_strikes,
+                                                filtered_maturities,
+                                                optimal_params,
+                                                option_type='put',
+                                                )
         fitted_call_ivs = np.zeros(fitted_call_prices.shape)
         fitted_put_ivs = np.zeros(fitted_put_prices.shape)
         for m, maturity in enumerate(filtered_maturities):
@@ -544,7 +566,12 @@ class RoughBergomiEngine:
         fitted_ivs = np.zeros_like(fitted_call_ivs)
         valid_mask = np.isfinite(fitted_call_ivs) & np.isfinite(fitted_put_ivs)
         fitted_ivs[valid_mask] = (fitted_call_ivs[valid_mask] + fitted_put_ivs[valid_mask]) / 2
-        fitted_ivs[~valid_mask] = np.where(np.isfinite(fitted_call_ivs[~valid_mask]), fitted_call_ivs[~valid_mask], fitted_put_ivs[~valid_mask])
+        mask = ~valid_mask
+        fitted_ivs[mask] = np.where(
+            np.isfinite(fitted_call_ivs[mask]),
+            fitted_call_ivs[mask],
+            fitted_put_ivs[mask]
+        )
 
         result = CalibrationResult(self.cfg)
         result.optimal_params = {
@@ -624,9 +651,17 @@ class CalibrationResult:
             "message": convergence.message,
             "x": convergence.x.tolist(),
             "cost": convergence.cost,
-            "grad": convergence.grad.tolist() if hasattr(convergence.grad, 'tolist') else list(convergence.grad),
+            "grad": (
+            convergence.grad.tolist()
+            if hasattr(convergence.grad, 'tolist')
+            else list(convergence.grad)
+            ),
             "optimality": convergence.optimality,
-            "active_mask": convergence.active_mask.tolist() if hasattr(convergence.active_mask, 'tolist') else list(convergence.active_mask),
+            "active_mask": (
+            convergence.active_mask.tolist()
+            if hasattr(convergence.active_mask, 'tolist')
+            else list(convergence.active_mask)
+            ),
             "nfev": convergence.nfev,
             "njev": convergence.njev,
         }
