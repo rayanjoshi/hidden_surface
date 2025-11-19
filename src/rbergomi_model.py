@@ -149,23 +149,33 @@ def implied_volatility(
 
 
 @njit
-def get_kernel_values(alpha: float, n_time: int):
+def precompute_convolution_matrix(alpha: float, n_steps: int) -> np.ndarray:
     """
-    Compute kernel values for the Rough Bergomi model.
+    Pre-compute the lower-triangular convolution matrix for the Hybrid scheme.
 
-    Args:
-        alpha: Roughness parameter (H - 0.5 where H is Hurst exponent).
-        n_time: Number of time steps.
+    Parameters
+    ----------
+    alpha : float
+        Fractional order parameter.
+    n_steps : int
+        Number of time steps (non-negative).
 
-    Returns:
-        Array of kernel values.
+    Returns
+    -------
+    np.ndarray
+        Lower-triangular matrix of shape (n_steps + 1, n_steps + 1).
     """
-    kernel = np.zeros(n_time)
-    # compute kernel entries properly and divide once (avoid in-loop slicing)
-    for m in range(n_time):
-        # formula: ((m+1)^(alpha+1) - m^(alpha+1)) / (alpha+1)
-        kernel[m] = ((m + 1) ** (alpha + 1) - m ** (alpha + 1)) / (alpha + 1)
-    return kernel
+    n = n_steps + 1
+    K = np.zeros((n, n))
+    kernel = np.zeros(n)
+    for m in range(1, n):
+        kernel[m] = (m + 1)**(alpha + 1) - m**(alpha + 1)
+    kernel[1:] /= (alpha + 1)
+
+    for i in range(n):
+        for j in range(i + 1):
+            K[i, j] = kernel[i - j]
+    return K
 
 
 @njit(parallel=True)
@@ -176,10 +186,11 @@ def simulate_rbergomi_paths(
     eta: float,
     hurst: float,
     rho: float,
-    f_variance,
-    all_g1,
-    all_z,
-    short_rates,
+    f_variance: np.ndarray,
+    all_g1: np.ndarray,
+    all_z: np.ndarray,
+    short_rates: np.ndarray,
+    K: np.ndarray,
 ):
     """
     Simulate stock and variance paths using the Rough Bergomi model.
@@ -195,6 +206,7 @@ def simulate_rbergomi_paths(
         all_g1: Random increments for variance process.
         all_z: Random increments for stock process.
         short_rates: Short rates for each time step.
+        K: Precomputed convolution matrix.
 
     Returns:
         Tuple of (stock paths, variance paths).
@@ -203,12 +215,12 @@ def simulate_rbergomi_paths(
     alpha = max(alpha, -0.45)
     dt = maturity / n_steps
     n_time = n_steps + 1
-    kernel = get_kernel_values(alpha, n_time)
+    sqrt_dt = np.sqrt(dt)
 
     delta_w1 = np.zeros((n_paths, n_time))
-    delta_w1[:, 1:] = all_g1 * np.sqrt(dt)
+    delta_w1[:, 1:] = all_g1 * sqrt_dt
     delta_w2 = np.zeros((n_paths, n_time))
-    delta_w2[:, 1:] = all_z * np.sqrt(dt)
+    delta_w2[:, 1:] = all_z * sqrt_dt
     delta_ws = rho * delta_w1 + np.sqrt(1 - rho**2) * delta_w2
 
     s_paths = np.zeros((n_paths, n_time))
@@ -218,12 +230,7 @@ def simulate_rbergomi_paths(
 
     w = np.zeros((n_paths, n_time))
     for p in prange(n_paths):
-        for i in range(n_time):
-            conv = 0.0
-            # accumulate convolution using kernel
-            for j in range(i + 1):
-                conv += kernel[i - j] * delta_w1[p, j]
-            w[p, i] = conv
+        w[p] = K @ delta_w1[p]
     w = w * (dt**alpha)  # scale w by dt**alpha
 
     # create time grid without using np.linspace to ensure numba compatibility
@@ -429,9 +436,11 @@ class RoughBergomiEngine:
             ValueError: If stock or variance paths contain invalid values.
         """
         eta, hurst, rho = params
+        alpha = hurst - 0.5
         n_steps = 2048 if max(maturities) < 0.1 else n_steps
         max_t = max(maturities)
         dt = max_t / n_steps
+        K = precompute_convolution_matrix(alpha, n_steps)
         t = np.linspace(0, max_t, n_steps + 1)
         xi = self.forward_variance_func(t)
         short_rates = self.get_short_rate(t)
@@ -451,7 +460,7 @@ class RoughBergomiEngine:
         all_z = np.vstack([all_z_base, -all_z_base])[:n_paths, :]
 
         s_paths, variance_paths = simulate_rbergomi_paths(
-            n_paths, n_steps, max_t, eta, hurst, rho, xi, all_g1, all_z, short_rates
+            n_paths, n_steps, max_t, eta, hurst, rho, xi, all_g1, all_z, short_rates, K
         )
         if np.any(np.isnan(s_paths)) or np.any(s_paths <= 0):
             self.logger.error("Stock paths contain NaN or non-positive values")
