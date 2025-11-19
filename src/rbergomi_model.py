@@ -15,7 +15,7 @@ Dependencies:
     - hydra
     - omegaconf
 """
-from typing import Optional
+from typing import Optional, Dict
 from pathlib import Path
 import json
 import numpy as np
@@ -31,7 +31,7 @@ import matplotlib.pyplot as plt
 
 from scripts.logging_config import get_logger, setup_logging
 
-def black_scholes_call(s, k, t, r=0, q=0, sigma = 0.2):
+def black_scholes_call(s: np.ndarray | float, k: np.ndarray | float, t: np.ndarray | float, r: float = 0, q: float = 0, sigma: float | np.ndarray = 0.2) -> np.ndarray:
     """
     Calculate the Black-Scholes call option price.
 
@@ -49,19 +49,15 @@ def black_scholes_call(s, k, t, r=0, q=0, sigma = 0.2):
     s = np.asarray(s)
     k = np.asarray(k)
     t = np.asarray(t)
-    r = np.asarray(r) if not isinstance(r, float) else r
-    q = np.asarray(q) if not isinstance(q, float) else q
-    sigma = np.asarray(sigma) if not isinstance(sigma, float) else sigma
-
     sigma = np.where(sigma < 1e-10, 1e-10, sigma)
     sqrt_t = np.sqrt(t)
-    d1 = (np.log(s / k) + (r - q + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t + 1e-10)
+    d1 = (np.log(s / k) + (r - q + 0.5 * sigma**2) * t) / (sigma * sqrt_t + 1e-10)
     d2 = d1 - sigma * sqrt_t
     call_price = s * np.exp(-q * t) * norm.cdf(d1) - k * np.exp(-r * t) * norm.cdf(d2)
     call_price = np.where(sigma < 1e-10, np.maximum(s - k, 0.0) * np.exp(-r * t), call_price)
     return call_price
 
-def black_scholes_put(s, k, t, r=0, q=0, sigma=0.2):
+def black_scholes_put(s: np.ndarray | float, k: np.ndarray | float, t: np.ndarray | float, r: float = 0, q: float = 0, sigma: float | np.ndarray = 0.2):
     """
     Calculate the Black-Scholes put option price.
 
@@ -79,21 +75,17 @@ def black_scholes_put(s, k, t, r=0, q=0, sigma=0.2):
     s = np.asarray(s)
     k = np.asarray(k)
     t = np.asarray(t)
-    r = np.asarray(r) if not isinstance(r, float) else r
-    q = np.asarray(q) if not isinstance(q, float) else q
-    sigma = np.asarray(sigma) if not isinstance(sigma, float) else sigma
-
     sigma = np.where(sigma < 1e-10, 1e-10, sigma)
     sqrt_t = np.sqrt(t)
-    d1 = (np.log(s / k) + (r - q + 0.5 * sigma ** 2) * t) / (sigma * sqrt_t + 1e-10)
+    d1 = (np.log(s / k) + (r - q + 0.5 * sigma**2) * t) / (sigma * sqrt_t + 1e-10)
     d2 = d1 - sigma * sqrt_t
     put_price = k * np.exp(-r * t) * norm.cdf(-d2) - s * np.exp(-q * t) * norm.cdf(-d1)
     put_price = np.where(sigma < 1e-10, np.maximum(k - s, 0.0) * np.exp(-r * t), put_price)
     return put_price
 
-def implied_volatility(price, s, k, t, r=0, q=0, option_type='call'):
+def implied_volatility(price: float, s: float, k: float, t: float, r: float = 0, q: float = 0, option_type: str = 'call') -> float:
     """
-    Compute implied volatility for a call option using Black-Scholes.
+    Compute implied volatility for a call or put option using Black-Scholes.
 
     Args:
         price: Observed option price.
@@ -102,95 +94,52 @@ def implied_volatility(price, s, k, t, r=0, q=0, option_type='call'):
         t: Time to maturity in years.
         r: Risk-free rate (default: 0.0).
         q: Dividend yield (default: 0.0).
-        option_type: Option type, currently only 'call' is supported (default: 'call').
+        option_type: Option type, 'call' or 'put' (default: 'call').
 
     Returns:
         Implied volatility or np.nan if computation fails.
     """
     if price <= 0 or np.isnan(price):
         return np.nan
-    def objective(sigma):
+
+    def objective(sigma: float) -> float:
         if option_type == 'call':
             model_price = black_scholes_call(s, k, t, r, q, sigma)
-        else:  # 'put'
+        else:
             model_price = black_scholes_put(s, k, t, r, q, sigma)
-        return model_price - price
+        return float(np.atleast_1d(model_price)[0] - price)
+
     try:
-        iv = brentq(objective, 0.0001, 20.0, maxiter=500)
-        return iv
-    except ValueError as e:
-        get_logger("implied_volatility").warning(
-            "Failed to compute IV for price=%s, s=%s, k=%s, t=%s, type=%s: %s",
-            price, s, k, t, option_type, e
-        )
+        res = brentq(objective, 1e-6, 20.0)
+        if isinstance(res, tuple):
+            res = res[0]
+        return float(res)
+    except ValueError:
         return np.nan
 
-@njit
-def get_power_law_coefficients(alpha, steps):
-    """
-    Calculate power-law coefficients for the Rough Bergomi kernel.
-
-    Args:
-        alpha: Roughness parameter (H - 0.5 where H is Hurst exponent).
-        steps: Number of time steps.
-
-    Returns:
-        Array of power-law coefficients.
-    """
-    coefficients = np.zeros(steps)
-    eps = 1e-10
-
-    for i in range(steps):
-        k = i + 1
-        num = k ** (alpha + 1) - (k - 1) ** (alpha + 1)
-        base = num / (alpha + 1)
-        base = max(base, eps)
-        coefficients[k - 1] = base ** (1.0 / alpha)
-    return coefficients
 
 @njit
-def get_kernel_values(alpha, steps, time_step):
+def get_kernel_values(alpha: float, n_time: int):
     """
     Compute kernel values for the Rough Bergomi model.
 
     Args:
         alpha: Roughness parameter (H - 0.5 where H is Hurst exponent).
-        steps: Number of time steps.
-        time_step: Size of each time step.
+        n_time: Number of time steps.
 
     Returns:
         Array of kernel values.
     """
-    coefficients = get_power_law_coefficients(alpha, steps)
-    kernel = np.zeros(steps)
-    eps = 1e-10
-    for l in range(1, steps):
-        coeff = coefficients[l - 1]
-        coeff = max(coeff, eps)
-        kernel[l] = (coeff / time_step) ** alpha
+    kernel = np.zeros(n_time)
+    # compute kernel entries properly and divide once (avoid in-loop slicing)
+    for m in range(n_time):
+        # formula: ((m+1)^(alpha+1) - m^(alpha+1)) / (alpha+1)
+        kernel[m] = ((m + 1) ** (alpha + 1) - m ** (alpha + 1)) / (alpha + 1)
     return kernel
 
-@njit
-def create_toeplitz(kernel):
-    """
-    Create a Toeplitz matrix from kernel values.
-
-    Args:
-        kernel: Array of kernel values.
-
-    Returns:
-        Toeplitz matrix.
-    """
-    n = len(kernel)
-    toeplitz = np.zeros((n, n))
-    for j in range(n):
-        for i in range(j, n):
-            toeplitz[i, j] = kernel[i - j]
-    return toeplitz
-
 @njit(parallel=True)
-def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
-                            rho, f_variance, all_g1, all_z, all_g2, short_rates):
+def simulate_rbergomi_paths(n_paths: int, n_steps: int, maturity: float, eta: float, hurst: float,
+                            rho: float, f_variance, all_g1, all_z, short_rates):
     """
     Simulate stock and variance paths using the Rough Bergomi model.
 
@@ -204,7 +153,6 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
         f_variance: Forward variance curve.
         all_g1: Random increments for variance process.
         all_z: Random increments for stock process.
-        all_g2: Additional random increments for variance convolution.
         short_rates: Short rates for each time step.
 
     Returns:
@@ -214,9 +162,7 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
     alpha = max(alpha, -0.45)
     dt = maturity / n_steps
     n_time = n_steps + 1
-    kernel = get_kernel_values(alpha, n_time, dt)
-    toeplitz = create_toeplitz(kernel)
-    covariance_factor = dt ** (2 * alpha + 1) / (2 * alpha + 1)
+    kernel = get_kernel_values(alpha, n_time)
 
     delta_w1 = np.zeros((n_paths, n_time))
     delta_w1[:, 1:] = all_g1 * np.sqrt(dt)
@@ -224,46 +170,74 @@ def simulate_rbergomi_paths(n_paths, n_steps, maturity, eta, hurst,
     delta_w2[:, 1:] = all_z * np.sqrt(dt)
     delta_ws = rho * delta_w1 + np.sqrt(1 - rho ** 2) * delta_w2
 
-    recent_with_zero = np.zeros((n_paths, n_time))
-    recent_with_zero[:, 1:] = np.sqrt(covariance_factor) * all_g2
-
     s_paths = np.zeros((n_paths, n_time))
     variance_paths = np.zeros((n_paths, n_time))
     s_paths[:, 0] = 1.0
     variance_paths[:, 0] = f_variance[0]
 
     w = np.zeros((n_paths, n_time))
-    for p in prange(n_paths): # pylint: disable=not-an-iterable
-        conv = np.dot(toeplitz, delta_w1[p])
-        w[p] = conv + recent_with_zero[p]
-    w[:, 0] = 0
+    for p in prange(n_paths):
+        for i in range(n_time):
+            conv = 0.0
+            # accumulate convolution using kernel
+            for j in range(i + 1):
+                conv += kernel[i - j] * delta_w1[p, j]
+            w[p, i] = conv
+    w = w * (dt ** alpha)   # scale w by dt**alpha
 
-    t = np.linspace(0, maturity, n_time)
+    # create time grid without using np.linspace to ensure numba compatibility
+    t = np.empty(n_time)
+    for i in range(n_time):
+        t[i] = i * dt
     t_2h = t ** (2 * hurst)
+
     t_2h_tile = np.zeros((n_paths, n_time))
-    for p in prange(n_paths): # pylint: disable=not-an-iterable
-        t_2h_tile[p, :] = t_2h
+    for p in prange(n_paths):
+        for i in range(n_time):
+            t_2h_tile[p, i] = t_2h[i]
+
     exponent = eta * np.sqrt(2 * hurst) * w - 0.5 * (eta ** 2) * t_2h_tile
-    exponent = np.clip(exponent, -100, 100)
+    # clip can be safely simulated via min/max in numba
+    for p in prange(n_paths):
+        for i in range(n_time):
+            if exponent[p, i] > 100.0:
+                exponent[p, i] = 100.0
+            elif exponent[p, i] < -100.0:
+                exponent[p, i] = -100.0
+
     f_variance_tile = np.zeros((n_paths, n_time))
-    for p in prange(n_paths): # pylint: disable=not-an-iterable
-        f_variance_tile[p, :] = f_variance
+    for p in prange(n_paths):
+        for i in range(n_time):
+            f_variance_tile[p, i] = f_variance[i]
+
     variance_paths = f_variance_tile * np.exp(exponent)
     min_variance = 1e-10
-    variance_paths = np.maximum(variance_paths, min_variance)
+    for p in prange(n_paths):
+        for i in range(n_time):
+            if variance_paths[p, i] < min_variance:
+                variance_paths[p, i] = min_variance
 
     # Vectorized stock path update with prange for cumsum
     sqrt_variance = np.sqrt(variance_paths[:, :-1])
     short_rates_tile = np.zeros((n_paths, n_steps))
-    for p in prange(n_paths): # pylint: disable=not-an-iterable
-        short_rates_tile[p, :] = short_rates[:-1]
+    for p in prange(n_paths):
+        for i in range(n_steps):
+            short_rates_tile[p, i] = short_rates[i]
+
     drift = (short_rates_tile - 0.5 * variance_paths[:, :-1]) * dt
     diffusion = sqrt_variance * delta_ws[:, 1:]
     d_log_s = drift + diffusion
+
     log_s_cum = np.zeros_like(d_log_s)
-    for p in prange(n_paths): # pylint: disable=not-an-iterable
-        log_s_cum[p] = np.cumsum(d_log_s[p])
-    s_paths[:, 1:] = np.exp(log_s_cum)
+    for p in prange(n_paths):
+        cum = 0.0
+        for i in range(n_steps):
+            cum += d_log_s[p, i]
+            log_s_cum[p, i] = cum
+
+    for p in prange(n_paths):
+        for i in range(1, n_time):
+            s_paths[p, i] = np.exp(log_s_cum[p, i - 1])
 
     return s_paths, variance_paths
 
@@ -331,7 +305,7 @@ class RoughBergomiEngine:
         self.logger.info("Forward variance data range: %s to %s", start, end)
 
 
-    def get_yield(self, t):
+    def get_yield(self, t: float | np.ndarray) -> float | np.ndarray:
         """
         Interpolate yield curve at a given time.
 
@@ -341,9 +315,13 @@ class RoughBergomiEngine:
         Returns:
             Interpolated yield value.
         """
-        return splev(t, self.yield_spl, ext=0)
+        res = splev(t, self.yield_spl, ext=0)
+        res_arr = np.asarray(res)
+        if np.ndim(res_arr) == 0:
+            return float(res_arr)
+        return res_arr
 
-    def get_short_rate(self, t):
+    def get_short_rate(self, t: float | np.ndarray) -> float | np.ndarray:
         """
         Compute short rate using yield curve and its derivative.
 
@@ -354,18 +332,27 @@ class RoughBergomiEngine:
             Short rate(s) at the specified time(s).
         """
         if np.isscalar(t):
-            if t <= 0:
-                t = 1e-6
-            rate = splev(t, self.yield_spl, ext=0)
-            d_rate_dt = splev(t, self.yield_spl, der=1, ext=0)
-            return rate + t * d_rate_dt
+            try:
+                t_val = float(t)
+            except (TypeError, ValueError):
+                t_val = 1e-6
+            if t_val <= 0.0:
+                t_val = 1e-6
+            rate = splev(t_val, self.yield_spl, ext=0)
+            d_rate_dt = splev(t_val, self.yield_spl, der=1, ext=0)
+            rate_arr = np.atleast_1d(rate)
+            d_rate_dt_arr = np.atleast_1d(d_rate_dt)
+            rate_scalar = float(rate_arr[0])
+            d_rate_dt_scalar = float(d_rate_dt_arr[0])
+            return rate_scalar + t_val * d_rate_dt_scalar
         t = np.maximum(t, 1e-6)
-        rate = splev(t, self.yield_spl, ext=0)
-        d_rate_dt = splev(t, self.yield_spl, der=1, ext=0)
-        return rate + t * d_rate_dt
+        t_arr = np.asarray(t, dtype=float)
+        rate = np.asarray(splev(t_arr, self.yield_spl, ext=0), dtype=float)
+        d_rate_dt = np.asarray(splev(t_arr, self.yield_spl, der=1, ext=0), dtype=float)
+        return rate + t_arr * d_rate_dt
 
-    def price_options(self, strikes, maturities, params,
-                    n_paths=50000, n_steps=512, return_iv=False, option_type='call'):
+    def price_options(self, strikes: np.ndarray, maturities: np.ndarray, params: tuple,
+                    n_paths: int = 50000, n_steps: int = 512, return_iv: bool = False, option_type: str = 'call') -> np.ndarray:
         """
         Price options using the Rough Bergomi model.
 
@@ -405,12 +392,9 @@ class RoughBergomiEngine:
         all_z_base = np.random.randn(n_base, n_steps)
         all_z = np.vstack([all_z_base, -all_z_base])[:n_paths, :]
 
-        all_g2_base = np.random.randn(n_base, n_steps)
-        all_g2 = np.vstack([all_g2_base, -all_g2_base])[:n_paths, :]
-
         s_paths, variance_paths = simulate_rbergomi_paths(n_paths, n_steps, max_t,
                                                         eta, hurst, rho, xi, all_g1, all_z,
-                                                        all_g2, short_rates)
+                                                        short_rates)
         if np.any(np.isnan(s_paths)) or np.any(s_paths <= 0):
             self.logger.error("Stock paths contain NaN or non-positive values")
             raise ValueError("Invalid stock paths")
@@ -421,7 +405,7 @@ class RoughBergomiEngine:
         # Vectorized pricing
         indices = np.round(maturities / dt).astype(int)
         s_t_all = s_paths[:, indices]
-        yields = self.get_yield(maturities)
+        yields = np.atleast_1d(self.get_yield(maturities))
         discounts = np.exp(-yields * maturities)
         if option_type == 'call':
             payoffs = np.maximum(s_t_all[:, :, None] - strikes[None, None, :], 0)
@@ -454,7 +438,7 @@ class RoughBergomiEngine:
             return ivs
         return prices
 
-    def calibrate(self, target_call_prices, target_put_prices, strikes, maturities, initial_params):
+    def calibrate(self, target_call_prices: Optional[np.ndarray], target_put_prices: Optional[np.ndarray], strikes: np.ndarray, maturities: np.ndarray, initial_params: tuple) -> 'CalibrationResult':
         """
         Calibrate the Rough Bergomi model to market prices.
 
@@ -607,19 +591,19 @@ class CalibrationResult:
         convergence_info: Optimization results from least_squares.
         simulation_stats: Placeholder for simulation statistics.
     """
-    def __init__(self, cfg: DictConfig):
+    def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
-        self.optimal_params = {}
-        self.fitted_ivs = None
-        self.market_ivs = None
-        self.rmse = 0.0
+        self.optimal_params: Dict[str, float] = {}
+        self.fitted_ivs: Optional[np.ndarray] = None
+        self.market_ivs: Optional[np.ndarray] = None
+        self.rmse: float = 0.0
         self.convergence_info = {}
         self.simulation_stats = {}
         script_dir = Path(__file__).parent
         repo_root = script_dir.parent
         self.save_path = Path(repo_root / self.cfg.rbergomi.save_path).resolve()
 
-    def plot_fit_quality(self):
+    def plot_fit_quality(self) -> None:
         """
         Plot market vs. model implied volatilities.
         """
@@ -635,7 +619,7 @@ class CalibrationResult:
         self.save_path = self.save_path / "market_vs_model_iv.svg"
         plt.savefig( self.save_path, format='svg')
 
-    def generate_report(self):
+    def generate_report(self) -> Dict:
         """
         Generate a dictionary report of calibration results.
 
