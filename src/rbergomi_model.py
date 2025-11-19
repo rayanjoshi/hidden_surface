@@ -24,7 +24,7 @@ import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d, splev, splrep
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, OptimizeResult
 import hydra
 from omegaconf import DictConfig
 from numba import njit, prange
@@ -319,7 +319,7 @@ class RoughBergomiEngine:
             self.df["maturity_years"],
             self.df["forward_variance"],
             bounds_error=False,
-            fill_value="extrapolate",
+            fill_value=float(self.df["forward_variance"].mean()),
         )
         iv_surface_path = Path(repo_root / self.cfg.iv_surface.surface_path).resolve()
         self.iv_surface = np.load(iv_surface_path)
@@ -390,8 +390,14 @@ class RoughBergomiEngine:
         """
         if np.isscalar(t):
             try:
-                t_val = float(t)
-            except (TypeError, ValueError):
+                # Convert to a numpy scalar/array first and extract a Python scalar
+                t_arr = np.asarray(t)
+                # If complex-valued, use the real part to avoid float(complex) errors
+                if np.iscomplexobj(t_arr):
+                    t_val = float(np.real(t_arr).item())
+                else:
+                    t_val = float(t_arr.item())
+            except (TypeError, ValueError, IndexError, AttributeError):
                 t_val = 1e-6
             if t_val <= 0.0:
                 t_val = 1e-6
@@ -412,7 +418,7 @@ class RoughBergomiEngine:
         self,
         strikes: np.ndarray,
         maturities: np.ndarray,
-        params: tuple,
+        params: tuple[float, float, float] | np.ndarray,
         n_paths: int = 50000,
         n_steps: int = 512,
         return_iv: bool = False,
@@ -443,7 +449,7 @@ class RoughBergomiEngine:
         K = precompute_convolution_matrix(alpha, n_steps)
         t = np.linspace(0, max_t, n_steps + 1)
         xi = self.forward_variance_func(t)
-        short_rates = self.get_short_rate(t)
+        short_rates = np.asarray(self.get_short_rate(t), dtype=float)
         if np.any(xi <= 0) or np.any(np.isnan(xi)):
             self.logger.error(f"Invalid forward variance values: {xi}")
             raise ValueError("Forward variance contains non-positive or NaN values")
@@ -470,9 +476,9 @@ class RoughBergomiEngine:
             raise ValueError("Invalid variance paths")
 
         # Vectorized pricing
-        indices = np.round(maturities / dt).astype(int)
+        indices = np.round(maturities / dt).astype(np.int64)
         s_t_all = s_paths[:, indices]
-        yields = np.atleast_1d(self.get_yield(maturities))
+        yields = np.asarray(self.get_yield(maturities), dtype=float)
         discounts = np.exp(-yields * maturities)
         if option_type == "call":
             payoffs = np.maximum(s_t_all[:, :, None] - strikes[None, None, :], 0)
@@ -484,7 +490,7 @@ class RoughBergomiEngine:
         if return_iv:
             ivs = np.zeros(prices.shape)
             for m, maturity in enumerate(maturities):
-                r = yields[m]
+                r = float(yields[m])
                 for k, strike in enumerate(strikes):
                     if prices[m, k] <= 0 or np.isnan(prices[m, k]):
                         self.logger.warning(
@@ -511,7 +517,7 @@ class RoughBergomiEngine:
         target_put_prices: Optional[np.ndarray],
         strikes: np.ndarray,
         maturities: np.ndarray,
-        initial_params: tuple,
+        initial_params: tuple[float, float, float] | np.ndarray,
     ) -> "CalibrationResult":
         """
         Calibrate the Rough Bergomi model to market prices.
@@ -528,6 +534,15 @@ class RoughBergomiEngine:
         """
         valid_indices = maturities >= 0.01
         filtered_maturities = maturities[valid_indices]
+
+        # Ensure target price arrays are present; if None, replace with NaN arrays
+        n_maturities = np.asarray(maturities).size
+        n_strikes = np.asarray(strikes).size
+        if target_call_prices is None:
+            target_call_prices = np.full((n_maturities, n_strikes), np.nan)
+        if target_put_prices is None:
+            target_put_prices = np.full((n_maturities, n_strikes), np.nan)
+
         filtered_call_prices = target_call_prices[valid_indices]
         filtered_put_prices = target_put_prices[valid_indices]
         filtered_strikes = strikes
@@ -581,7 +596,7 @@ class RoughBergomiEngine:
         bounds = ([0.01, 0.001, -0.95], [2.0, 0.49, 0.95])
         res = least_squares(
             objective,
-            initial_params,
+            np.asarray(initial_params),
             bounds=bounds,
             method="trf",
             max_nfev=5000,
@@ -610,7 +625,7 @@ class RoughBergomiEngine:
         fitted_call_ivs = np.zeros(fitted_call_prices.shape)
         fitted_put_ivs = np.zeros(fitted_put_prices.shape)
         for m, maturity in enumerate(filtered_maturities):
-            r = self.get_yield(maturity)
+            r = float(self.get_yield(maturity))
             for k, strike in enumerate(strikes):
                 # Compute IV from calls
                 if fitted_call_prices[m, k] > 0 and not np.isnan(
@@ -664,14 +679,21 @@ class RoughBergomiEngine:
         result.fitted_ivs = fitted_ivs
         result.market_ivs = self.iv_surface[valid_indices]
 
-        valid_mask = np.isfinite(fitted_ivs) & np.isfinite(result.market_ivs)
-        if np.any(valid_mask):
-            result.rmse = np.sqrt(
-                np.mean((fitted_ivs[valid_mask] - result.market_ivs[valid_mask]) ** 2)
-            )
-        else:
+        # Ensure arrays are not None before using numpy ufuncs to satisfy static type checkers
+        if result.fitted_ivs is None or result.market_ivs is None:
             result.rmse = np.nan
-            self.logger.warning("No valid IVs for RMSE calculation")
+            self.logger.warning("Cannot compute RMSE because fitted_ivs or market_ivs is None")
+        else:
+            valid_mask = np.isfinite(result.fitted_ivs) & np.isfinite(result.market_ivs)
+            if np.any(valid_mask):
+                result.rmse = np.sqrt(
+                    np.mean(
+                        (result.fitted_ivs[valid_mask] - result.market_ivs[valid_mask]) ** 2
+                    )
+                )
+            else:
+                result.rmse = np.nan
+                self.logger.warning("No valid IVs for RMSE calculation")
 
         result.convergence_info = res
         return result
@@ -692,11 +714,12 @@ class CalibrationResult:
 
     def __init__(self, cfg: DictConfig) -> None:
         self.cfg = cfg
+        self.logger = get_logger("CalibrationResult")
         self.optimal_params: Dict[str, float] = {}
         self.fitted_ivs: Optional[np.ndarray] = None
         self.market_ivs: Optional[np.ndarray] = None
         self.rmse: float = 0.0
-        self.convergence_info = {}
+        self.convergence_info: OptimizeResult = OptimizeResult()
         self.simulation_stats = {}
         script_dir = Path(__file__).parent
         repo_root = script_dir.parent
@@ -706,6 +729,9 @@ class CalibrationResult:
         """
         Plot market vs. model implied volatilities.
         """
+        if self.market_ivs is None or self.fitted_ivs is None:
+            self.logger.warning("Cannot plot - IV surfaces not computed")
+            return
         fig, ax = plt.subplots()
         _unused = fig
         ax.plot(self.market_ivs.flatten(), label="Market IV")
@@ -792,7 +818,7 @@ class CalibrationResult:
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="rbergomi_model")
-def main(cfg: Optional[DictConfig] = None):
+def main(cfg: DictConfig):
     """
     Main entry point for rbergomi model calculation.
 
@@ -830,7 +856,7 @@ def main(cfg: Optional[DictConfig] = None):
     target_call_prices = np.zeros_like(rbergomi_model.iv_surface)
     target_put_prices = np.zeros_like(rbergomi_model.iv_surface)
     for m, maturity in enumerate(maturities):
-        r = rbergomi_model.get_yield(maturity)
+        r = float(np.asarray(rbergomi_model.get_yield(maturity)))
         for k, strike in enumerate(rbergomi_model.strikes):
             if (
                 np.isnan(rbergomi_model.iv_surface[m, k])
