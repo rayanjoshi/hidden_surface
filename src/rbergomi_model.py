@@ -38,6 +38,7 @@ from typing import Optional, Dict
 from pathlib import Path
 import json
 import numpy as np
+from numpy.random import default_rng
 import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import brentq
@@ -582,13 +583,14 @@ class RoughBergomiEngine:
         self.logger.info(f"Forward variance shape: {xi.shape}, values: {xi[:5]}...")
 
         # --------------------- Antithetic variates --------------------- #
-        np.random.seed(42)
+        seed = self.cfg.seed
+        rng = default_rng(seed)
         n_base = n_paths // 2
 
-        all_g1_base = np.random.randn(n_base, n_steps)
+        all_g1_base = rng.standard_normal((n_base, n_steps))
         all_g1 = np.vstack([all_g1_base, -all_g1_base])[:n_paths, :]
 
-        all_z_base = np.random.randn(n_base, n_steps)
+        all_z_base = rng.standard_normal((n_base, n_steps))
         all_z = np.vstack([all_z_base, -all_z_base])[:n_paths, :]
 
         # --------------------- Simulation --------------------- #

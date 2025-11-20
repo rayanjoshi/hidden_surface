@@ -9,3 +9,5 @@ iv_surface:
 
 rbergomi:
   save_path: "data/rbergomi_model"
+
+seed: 42  # Random seed for reproducibility
