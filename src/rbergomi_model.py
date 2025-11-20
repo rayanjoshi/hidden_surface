@@ -169,8 +169,8 @@ def precompute_convolution_matrix(alpha: float, n_steps: int) -> np.ndarray:
     K = np.zeros((n, n))
     kernel = np.zeros(n)
     for m in range(1, n):
-        kernel[m] = (m + 1)**(alpha + 1) - m**(alpha + 1)
-    kernel[1:] /= (alpha + 1)
+        kernel[m] = (m + 1) ** (alpha + 1) - m ** (alpha + 1)
+    kernel[1:] /= alpha + 1
 
     for i in range(n):
         for j in range(i + 1):
@@ -423,6 +423,7 @@ class RoughBergomiEngine:
         n_steps: int = 512,
         return_iv: bool = False,
         option_type: str = "call",
+        return_terminal_paths: bool = False,
     ) -> np.ndarray:
         """
         Price options using the Rough Bergomi model.
@@ -434,6 +435,7 @@ class RoughBergomiEngine:
             n_paths: Number of simulation paths (default: 50000).
             n_steps: Number of time steps (default: 512).
             return_iv: If True, return implied volatilities instead of prices (default: False).
+            return_terminal_paths: If True, return the terminal stock paths (default: False).
 
         Returns:
             Array of option prices or implied volatilities.
@@ -480,34 +482,32 @@ class RoughBergomiEngine:
         s_t_all = s_paths[:, indices]
         yields = np.asarray(self.get_yield(maturities), dtype=float)
         discounts = np.exp(-yields * maturities)
+        s_t = s_t_all
+        discounts = discounts[:, None]
+
+        if return_terminal_paths:
+            # Shape (n_paths, n_maturities, 1)
+            return s_t[:, :, np.newaxis]
+
+        # Payoffs on already-discounted paths
         if option_type == "call":
-            payoffs = np.maximum(s_t_all[:, :, None] - strikes[None, None, :], 0)
-        else:  # 'put'
-            payoffs = np.maximum(strikes[None, None, :] - s_t_all[:, :, None], 0)
-        prices = np.mean(payoffs, axis=0) * discounts[:, None]
-        prices = np.maximum(prices, 1e-12)
+            payoffs = np.maximum(s_t[:, :, None] - strikes[None, None, :], 0)
+        else:  # put
+            payoffs = np.maximum(strikes[None, None, :] - s_t[:, :, None], 0)
+
+        prices = np.mean(payoffs, axis=0) * discounts  # discount after the nonlinearity
+        prices = np.clip(prices, 1e-12, None)
 
         if return_iv:
             ivs = np.zeros(prices.shape)
             for m, maturity in enumerate(maturities):
                 r = float(yields[m])
                 for k, strike in enumerate(strikes):
-                    if prices[m, k] <= 0 or np.isnan(prices[m, k]):
-                        self.logger.warning(
-                            "Invalid price at maturity %s, strike %s: %s",
-                            maturity,
-                            strike,
-                            prices[m, k],
-                        )
-                        ivs[m, k] = np.nan
-                    else:
-                        ivs[m, k] = implied_volatility(
-                            prices[m, k],
-                            1.0,
-                            strike,
-                            maturity,
-                            r=r,
-                        )
+                    ivs[m, k] = (
+                        implied_volatility(prices[m, k], 1.0, strike, maturity, r=r)
+                        if prices[m, k] > 0
+                        else np.nan
+                    )
             return ivs
         return prices
 
@@ -550,18 +550,26 @@ class RoughBergomiEngine:
 
         def objective(params):
             eta, hurst, rho = params
-            model_call_prices = self.price_options(
+            s_t = self.price_options(
                 filtered_strikes,
                 filtered_maturities,
                 params,
-                option_type="call",
+                return_terminal_paths=True,  # ← only one MC run
+            ).squeeze(-1)  # shape: (n_paths, n_maturities)
+
+            discounts = np.exp(
+                -self.get_yield(filtered_maturities) * filtered_maturities
+            )[:, None]
+
+            call_payoffs = np.maximum(
+                s_t[:, :, None] - filtered_strikes[None, None, :], 0
             )
-            model_put_prices = self.price_options(
-                filtered_strikes,
-                filtered_maturities,
-                params,
-                option_type="put",
+            put_payoffs = np.maximum(
+                filtered_strikes[None, None, :] - s_t[:, :, None], 0
             )
+
+            model_call_prices = np.mean(call_payoffs, axis=0) * discounts
+            model_put_prices = np.mean(put_payoffs, axis=0) * discounts
 
             valid_call_mask = (filtered_call_prices > 0) & np.isfinite(
                 filtered_call_prices
@@ -610,65 +618,29 @@ class RoughBergomiEngine:
         optimal_params = res.x
 
         # Compute fitted IVs (using both call and put prices for maximum consistency)
-        fitted_call_prices = self.price_options(
+        s_t_final = self.price_options(
             filtered_strikes,
             filtered_maturities,
             optimal_params,
-            option_type="call",
-        )
-        fitted_put_prices = self.price_options(
-            filtered_strikes,
-            filtered_maturities,
-            optimal_params,
-            option_type="put",
-        )
-        fitted_call_ivs = np.zeros(fitted_call_prices.shape)
-        fitted_put_ivs = np.zeros(fitted_put_prices.shape)
+            return_terminal_paths=True,
+        ).squeeze(-1)  # (n_paths, n_maturities)
+
+        discounts = np.exp(
+            -self.get_yield(filtered_maturities) * filtered_maturities
+        )[:, None]  # (n_maturities, 1)
+
+        call_payoffs = np.maximum(s_t_final[:, :, None] - filtered_strikes[None, None, :], 0)
+        fitted_call_prices = np.mean(call_payoffs, axis=0) * discounts
+        fitted_ivs = np.full_like(fitted_call_prices, np.nan)
+
         for m, maturity in enumerate(filtered_maturities):
-            r = float(self.get_yield(maturity))
-            for k, strike in enumerate(strikes):
-                # Compute IV from calls
-                if fitted_call_prices[m, k] > 0 and not np.isnan(
-                    fitted_call_prices[m, k]
-                ):
-                    fitted_call_ivs[m, k] = implied_volatility(
-                        fitted_call_prices[m, k],
-                        1.0,
-                        strike,
-                        maturity,
-                        r=r,
-                        option_type="call",
+            r = float(np.array(self.get_yield(maturity)).item())
+            for k, strike in enumerate(filtered_strikes):
+                price = fitted_call_prices[m, k]
+                if price > 0 and np.isfinite(price):
+                    fitted_ivs[m, k] = implied_volatility(
+                        price, 1.0, strike, maturity, r=r, option_type="call"
                     )
-                else:
-                    fitted_call_ivs[m, k] = np.nan
-
-                # Compute IV from puts
-                if fitted_put_prices[m, k] > 0 and not np.isnan(
-                    fitted_put_prices[m, k]
-                ):
-                    fitted_put_ivs[m, k] = implied_volatility(
-                        fitted_put_prices[m, k],
-                        1.0,
-                        strike,
-                        maturity,
-                        r=r,
-                        option_type="put",
-                    )
-                else:
-                    fitted_put_ivs[m, k] = np.nan
-
-        # Average the IVs from calls and puts (they should be identical due to put-call parity)
-        fitted_ivs = np.zeros_like(fitted_call_ivs)
-        valid_mask = np.isfinite(fitted_call_ivs) & np.isfinite(fitted_put_ivs)
-        fitted_ivs[valid_mask] = (
-            fitted_call_ivs[valid_mask] + fitted_put_ivs[valid_mask]
-        ) / 2
-        mask = ~valid_mask
-        fitted_ivs[mask] = np.where(
-            np.isfinite(fitted_call_ivs[mask]),
-            fitted_call_ivs[mask],
-            fitted_put_ivs[mask],
-        )
 
         result = CalibrationResult(self.cfg)
         result.optimal_params = {
@@ -682,13 +654,16 @@ class RoughBergomiEngine:
         # Ensure arrays are not None before using numpy ufuncs to satisfy static type checkers
         if result.fitted_ivs is None or result.market_ivs is None:
             result.rmse = np.nan
-            self.logger.warning("Cannot compute RMSE because fitted_ivs or market_ivs is None")
+            self.logger.warning(
+                "Cannot compute RMSE because fitted_ivs or market_ivs is None"
+            )
         else:
             valid_mask = np.isfinite(result.fitted_ivs) & np.isfinite(result.market_ivs)
             if np.any(valid_mask):
                 result.rmse = np.sqrt(
                     np.mean(
-                        (result.fitted_ivs[valid_mask] - result.market_ivs[valid_mask]) ** 2
+                        (result.fitted_ivs[valid_mask] - result.market_ivs[valid_mask])
+                        ** 2
                     )
                 )
             else:
