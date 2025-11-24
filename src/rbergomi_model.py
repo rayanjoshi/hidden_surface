@@ -230,6 +230,8 @@ def precompute_convolution_matrix(alpha: float, n_steps: int) -> np.ndarray:
     np.ndarray
         (n_steps+1, n_steps+1) lower-triangular convolution matrix
     """
+    if abs(alpha + 1) < 1e-10:
+        raise ValueError("alpha + 1 too close to zero")
     n = n_steps + 1
     K = np.zeros((n, n))
     kernel = np.zeros(n)
@@ -264,7 +266,7 @@ def simulate_rbergomi_paths(
     Simulate correlated rough volatility paths using the Hybrid scheme.
 
     Dynamics:
-        dS_t / S_t = √V_t dW_t^S
+        d(log S_t) = (r_t - V_t/2) dt + √V_t dW_t^S
         V_t = ξ_t(0) exp( η √(2H) W^H_t - (η²/2) t^{2H} )
 
     where W^H is a fractional Brownian motion with Hurst H < 0.5,
@@ -303,7 +305,6 @@ def simulate_rbergomi_paths(
         Instantaneous variance paths V_t (n_paths × n_steps+1)
     """
     alpha = hurst - 0.5
-    alpha = max(alpha, -0.45)  # numerical stability floor
     dt = maturity / n_steps
     n_time = n_steps + 1
     sqrt_dt = np.sqrt(dt)
@@ -346,6 +347,8 @@ def simulate_rbergomi_paths(
 
     # ------------------------------------------------------------------ #
     # Variance process (log-normal rough vol)
+    # V_t = ξ_t(0) * exp(η √(2H) W^H_t - (1/2) η² t^(2H))
+    # where the √(2H) factor is part of the Riemann-Liouville fBm definition
     # ------------------------------------------------------------------ #
 
     exponent = eta * np.sqrt(2 * hurst) * w - 0.5 * (eta**2) * t_2h_tile
@@ -364,7 +367,7 @@ def simulate_rbergomi_paths(
 
     # Floor variance to avoid numerical issues
     variance_paths = f_variance_tile * np.exp(exponent)
-    min_variance = 1e-10
+    min_variance = 1e-6 * np.mean(f_variance)
     for p in prange(n_paths):
         for i in range(n_time):
             if variance_paths[p, i] < min_variance:
@@ -435,7 +438,10 @@ class RoughBergomiEngine:
             self.df["maturity_years"],
             self.df["forward_variance"],
             bounds_error=False,
-            fill_value=float(self.df["forward_variance"].mean()),
+            fill_value=(
+                float(self.df["forward_variance"].iloc[0]),
+                float(self.df["forward_variance"].iloc[-1])
+            ),
         )
 
         # --------------------- Implied volatility surface --------------------- #
@@ -501,6 +507,10 @@ class RoughBergomiEngine:
         Computed via spline derivative.
         """
         if np.isscalar(t):
+            # Handle t=0 case directly
+            if t == 0.0:
+                rate = float(np.atleast_1d(splev(1e-10, self.yield_spl, ext=0))[0])
+                return rate
             try:
                 # Convert to a numpy scalar/array first and extract a Python scalar
                 t_arr = np.asarray(t)
@@ -733,7 +743,7 @@ class RoughBergomiEngine:
             ) / filtered_put_prices[valid_put_mask]
 
             # Light L2 regularization toward realistic values
-            reg_weight = 0.001
+            reg_weight = 0.0001
             param_penalty = reg_weight * sum(
                 [(eta - 1.0) ** 2, 10 * (hurst - 0.07) ** 2, (rho + 0.6) ** 2]
             )
@@ -746,18 +756,21 @@ class RoughBergomiEngine:
 
             total_penalty = param_penalty + smoothness
 
-            return np.concatenate([all_errors, [total_penalty]])
+            if np.mean(np.abs(all_errors)) < 0.05:  # 5% relative error threshold
+                return np.concatenate([all_errors, [np.sqrt(total_penalty)]])
+            else:
+                return all_errors  # Focus on fitting first, regularize later
 
-        bounds = ([0.01, 0.001, -0.95], [2.0, 0.49, 0.95])
+        bounds = ([0.01, 0.001, -0.999], [2.0, 0.49, 0.95])
         res = least_squares(
             objective,
             np.asarray(initial_params),
             bounds=bounds,
             method="trf",
             max_nfev=5000,
-            ftol=1e-10,
-            gtol=1e-10,
-            xtol=1e-10,
+            ftol=1e-12,
+            gtol=1e-9,
+            xtol=1e-12,
             loss="soft_l1",
             verbose=2,
         )
@@ -976,7 +989,7 @@ def main(cfg: DictConfig):
     maturities_path = Path(repo_root / cfg.iv_surface.maturities_path).resolve()
 
     maturities = np.load(maturities_path)
-    initial_params = np.array([1.2, 0.07, -0.6])  # Initial guess for [eta, hurst, rho]
+    initial_params = np.array([1.5, 0.05, -0.95])  # Initial guess for [eta, hurst, rho]
     logger.info(f"Initial parameters: {initial_params}")
 
     logger.info("Pricing options...")
@@ -984,8 +997,8 @@ def main(cfg: DictConfig):
         strikes=rbergomi_model.strikes,
         maturities=maturities,
         params=initial_params,
-        n_paths=50000,
-        n_steps=1024,
+        n_paths=100000,
+        n_steps=2048,
         return_iv=False,
     )
     logger.info(f"Option prices:\n{option_prices}")
@@ -1012,6 +1025,18 @@ def main(cfg: DictConfig):
                 target_put_prices[m, k] = black_scholes_put(
                     s=1.0, k=strike, t=maturity, r=r, q=0, sigma=sigma
                 )
+                # Verify put-call parity as a sanity check
+                parity_diff = abs(
+                    (target_call_prices[m, k] - target_put_prices[m, k]) 
+                    - (1.0 - strike * np.exp(-r * maturity))
+                )
+                if parity_diff > 1e-6:
+                    logger.warning(
+                        "Put-call parity violation at K=%.3f, T=%.3f: diff=%.2e",
+                        strike,
+                        maturity,
+                        parity_diff,
+                    )
 
     calibration_result = rbergomi_model.calibrate(
         target_call_prices=target_call_prices,
