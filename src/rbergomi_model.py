@@ -550,6 +550,8 @@ class RoughBergomiEngine:
         return_iv: bool = False,
         option_type: str = "call",
         return_terminal_paths: bool = False,
+        precomputed_g1: np.ndarray | None = None,
+        precomputed_z: np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Price a set of European options using Monte-Carlo under rBergomi dynamics.
@@ -593,15 +595,20 @@ class RoughBergomiEngine:
         self.logger.info(f"Forward variance shape: {xi.shape}, values: {xi[:5]}...")
 
         # --------------------- Antithetic variates --------------------- #
-        seed = self.cfg.seed
-        rng = default_rng(seed)
-        n_base = n_paths // 2
+        # Optionally reuse precomputed normals for calibration stability
+        if precomputed_g1 is None or precomputed_z is None:
+            seed = self.cfg.seed
+            rng = default_rng(seed)
+            n_base = n_paths // 2
 
-        all_g1_base = rng.standard_normal((n_base, n_steps))
-        all_g1 = np.vstack([all_g1_base, -all_g1_base])[:n_paths, :]
+            all_g1_base = rng.standard_normal((n_base, n_steps))
+            all_g1 = np.vstack([all_g1_base, -all_g1_base])[:n_paths, :]
 
-        all_z_base = rng.standard_normal((n_base, n_steps))
-        all_z = np.vstack([all_z_base, -all_z_base])[:n_paths, :]
+            all_z_base = rng.standard_normal((n_base, n_steps))
+            all_z = np.vstack([all_z_base, -all_z_base])[:n_paths, :]
+        else:
+            all_g1 = precomputed_g1
+            all_z = precomputed_z
 
         # --------------------- Simulation --------------------- #
         s_paths, variance_paths = simulate_rbergomi_paths(
@@ -700,17 +707,33 @@ class RoughBergomiEngine:
         # ----------------------------------------------------------------- #
         # Objective: relative pricing errors + regularization
         # ----------------------------------------------------------------- #
+        bounds = ([0.01, 0.001, -0.999], [2.0, 0.49, 0.95])
+        # Pre-generate shared randomness for calibration to make the objective deterministic
+        n_paths = self.cfg.calibration.n_paths
+        n_steps = self.cfg.calibration.n_steps
+        seed = self.cfg.seed
+
+        rng_cal = default_rng(seed)
+        n_base_cal = n_paths // 2
+        g1_base_cal = rng_cal.standard_normal((n_base_cal, n_steps))
+        all_g1_cal = np.vstack([g1_base_cal, -g1_base_cal])[:n_paths, :]
+        z_base_cal = rng_cal.standard_normal((n_base_cal, n_steps))
+        all_z_cal = np.vstack([z_base_cal, -z_base_cal])[:n_paths, :]
 
         def objective(params):
             eta, hurst, rho = params
 
-            # One shared MC simulation for both calls and puts
+            # One shared MC simulation for both calls and puts using precomputed normals
             s_t = self.price_options(
                 filtered_strikes,
                 filtered_maturities,
                 params,
+                n_paths=n_paths,
+                n_steps=n_steps,
                 return_terminal_paths=True,
-            ).squeeze(-1)  # shape: (n_paths, n_maturities)
+                precomputed_g1=all_g1_cal,
+                precomputed_z=all_z_cal,
+            ).squeeze(-1)  # shape: (n_paths_cal, n_maturities)
 
             discounts = np.exp(
                 -self.get_yield(filtered_maturities) * filtered_maturities
@@ -743,7 +766,7 @@ class RoughBergomiEngine:
             ) / filtered_put_prices[valid_put_mask]
 
             # Light L2 regularization toward realistic values
-            reg_weight = 0.0001
+            reg_weight = self.cfg.calibration.regularisation_weight
             param_penalty = reg_weight * sum(
                 [(eta - 1.0) ** 2, 10 * (hurst - 0.07) ** 2, (rho + 0.6) ** 2]
             )
@@ -756,12 +779,8 @@ class RoughBergomiEngine:
 
             total_penalty = param_penalty + smoothness
 
-            if np.mean(np.abs(all_errors)) < 0.05:  # 5% relative error threshold
-                return np.concatenate([all_errors, [np.sqrt(total_penalty)]])
-            else:
-                return all_errors  # Focus on fitting first, regularize later
+            return np.concatenate([all_errors, [np.sqrt(total_penalty)]])
 
-        bounds = ([0.01, 0.001, -0.999], [2.0, 0.49, 0.95])
         res = least_squares(
             objective,
             np.asarray(initial_params),
