@@ -39,7 +39,7 @@ class MarketSurfaceBuilder:
         self.logger = get_logger("MarketSurfaceBuilder")
         script_dir = Path(__file__).parent
         repo_root = script_dir.parent
-        input_path = self.cfg.data_processor.output_path
+        input_path = self.cfg.select_date.output_path
         self.input_path = Path(repo_root / input_path).resolve()
         self.output_dir = Path(repo_root / self.cfg.surface_builder.output_dir).resolve()
         self.df = None
