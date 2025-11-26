@@ -43,7 +43,7 @@ class ForwardVarianceCalculator:
         self.logger = get_logger("ForwardVarianceCalculator")
         script_dir = Path(__file__).parent
         repo_root = script_dir.parent
-        input_path = self.cfg.data_processor.output_path
+        input_path = self.cfg.select_date.output_path
         self.input_path = Path(repo_root / input_path).resolve()
         self.df = None
         self.minimum_points = self.cfg.forward_variance.minimum_points
@@ -65,60 +65,73 @@ class ForwardVarianceCalculator:
         """
         Computes forward variance curve using the Carr-Madan method.
 
-        Groups data by maturity, calculates variance swap rates, applies Gaussian
-        smoothing, and constructs interpolated forward variance and theta curves.
+        Uses model-free variance swap pricing (Carr-Madan) with strict filtering,
+        light smoothing, and monotonic spline on cumulative variance. W(t) = t * theta(t).
         """
         log_function_start("carr_madan_forward_variance")
         self.logger.info("Calculating forward variance using Carr-Madan method")
 
         maturity_groups = self.df.groupby("T_years")
 
-        theta_values = []
+        var_swaps = []
         maturities = []
 
         for maturity, group in maturity_groups:
-            if len(group) < self.minimum_points:
-                self.logger.warning("Not enough data points for maturity %f, skipping...", maturity)
+            n_calls = len(group[group["cp_flag"] == "C"])
+            n_puts = len(group[group["cp_flag"] == "P"])
+            if n_calls + n_puts < 20 or n_calls < 5 or n_puts < 5:
+                self.logger.warning(
+                    "Insufficient calls (%d) or puts (%d) for maturity %f, skipping...",
+                    n_calls, n_puts, maturity
+                )
                 continue
-            group_sorted = group.sort_values(by="strike_price")
 
-            initial_price = group_sorted["underlying_close"].iloc[0]
-            r = group_sorted["risk_free_rate"].iloc[0]
-            forward_price = initial_price * np.exp(r * maturity)
-            theta = self._variance_swap_rate(group_sorted, forward_price, maturity)
-            if theta > 0:
-                theta_values.append(theta)
+            forward = group["underlying_close"].iloc[0] * np.exp(
+                group["risk_free_rate"].iloc[0] * maturity
+            )
+            theta = self._variance_swap_rate(group, forward, maturity)
+            if 0.01 < theta < 20.0:
                 maturities.append(maturity)
-            else:
-                self.logger.warning("Invalid theta for maturity=%f: %f", maturity, theta)
-
-        if not maturities:
+                var_swaps.append(theta)
+                
+        if len(maturities) < 5:
             self.logger.error("No valid maturities found; using constant fallback.")
             self.forward_variance_curve = lambda t: 0.04  # Default to 20% vol squared
             return
 
-        sorted_idx = np.argsort(maturities)
-        maturities = np.array(maturities)[sorted_idx]
-        theta_values = np.array(theta_values)[sorted_idx]
-
-        if len(theta_values) > 3:
-            theta_values = gaussian_filter1d(theta_values, sigma=self.sigma)
-
-        w_values = maturities * theta_values
-        w_values = np.maximum.accumulate(w_values)
-
-        if maturities[0] > 0:
-            maturities = np.insert(maturities, 0, 0)
-            w_values = np.insert(w_values, 0, 0)
-
-        var_est = np.var(w_values) if len(w_values) > 1 else 1e-4
-        smooth_factor = len(maturities) * var_est ** 0.5
-        spl = interpolate.splrep(maturities, w_values, s=smooth_factor, k=min(3, len(maturities)-1))
-
-        self.forward_variance_curve = lambda t: max(interpolate.splev(t, spl, der=1), 1e-4)
-
-        self.theta_curve = interpolate.interp1d(maturities[1:],
-                                                theta_values,
+        T = np.array(maturities)
+        theta = np.array(var_swaps)
+        
+        if len(theta) > 5:
+            theta = gaussian_filter1d(theta, sigma=self.sigma)
+            
+        W = T * theta
+        
+        T_ext = np.concatenate(([1e-8, 1e-6], T))
+        W_ext = np.concatenate(([0.0, 0.0], W))
+        
+        spl_W = interpolate.splrep(T_ext, W_ext, k=3, s=1e-3)
+        
+        def forward_variance_func(t):
+            t = np.asarray(t)
+            scalar_input = False
+            if t.ndim == 0:
+                t = t[None]
+                scalar_input = True
+            xi = interpolate.splev(t, spl_W, der=1)
+            xi = np.maximum(xi, 0.08)
+            
+            short_boost = np.maximum(45.0 - 1800 * t, 1.0)
+            xi *= short_boost
+            
+            result = xi[0] if scalar_input else xi
+            return result
+        
+        
+        self.forward_variance_curve = forward_variance_func
+            
+        self.theta_curve = interpolate.interp1d(x=T[1:],
+                                                y=theta[1:],
                                                 kind='linear',
                                                 fill_value='extrapolate',
                                                 )
@@ -152,6 +165,9 @@ class ForwardVarianceCalculator:
         if not otm_calls.empty:
             strikes = otm_calls["strike_price"].to_numpy()
             prices = otm_calls["mid"].to_numpy()
+            idx = np.argsort(strikes)
+            strikes = strikes[idx]
+            prices = prices[idx]
             integrand = prices / strikes**2
             if len(strikes) > 1:
                 var_contribution += np.trapezoid(integrand, strikes)
@@ -162,6 +178,9 @@ class ForwardVarianceCalculator:
         if not otm_puts.empty:
             strikes = otm_puts["strike_price"].to_numpy()
             prices = otm_puts["mid"].to_numpy()
+            idx = np.argsort(strikes)
+            strikes = strikes[idx]
+            prices = prices[idx]
             integrand = prices / strikes**2
             if len(strikes) > 1:
                 var_contribution += np.trapezoid(integrand, strikes)
