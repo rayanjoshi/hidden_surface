@@ -328,22 +328,12 @@ def simulate_rbergomi_paths(
     # Fractional Brownian motion via Hybrid convolution
     # ------------------------------------------------------------------ #
 
-    w = np.zeros((n_paths, n_time))
-    for p in prange(n_paths):
-        w[p] = K @ delta_w1[p]
-    w = w * (dt**alpha)  # scale w by dt**alpha
+    w = K @ delta_w1.T
+    w = w.T * (dt**alpha)
 
     # Time grid
-    t = np.empty(n_time)
-    for i in range(n_time):
-        t[i] = i * dt
+    t = np.linspace(0.0, maturity, n_time)
     t_2h = t ** (2 * hurst)
-
-    # Tile time vector for vectorized operations
-    t_2h_tile = np.zeros((n_paths, n_time))
-    for p in prange(n_paths):
-        for i in range(n_time):
-            t_2h_tile[p, i] = t_2h[i]
 
     # ------------------------------------------------------------------ #
     # Variance process (log-normal rough vol)
@@ -351,46 +341,42 @@ def simulate_rbergomi_paths(
     # where the √(2H) factor is part of the Riemann-Liouville fBm definition
     # ------------------------------------------------------------------ #
 
-    exponent = eta * np.sqrt(2 * hurst) * w - (eta**2) * t_2h_tile
-    
+    vol_part = eta * np.sqrt(2 * hurst) * w
+    drift_part = eta**2 * (t_2h)[None, :]  # (1, n_time)
+    drift_part = np.broadcast_to(drift_part, vol_part.shape)
+
+    exponent = vol_part - drift_part
+
     # Prevent overflow/underflow
     exponent = np.clip(exponent, -100.0, 100.0)
 
-    f_variance_tile = np.zeros((n_paths, n_time))
-    for p in prange(n_paths):
-        for i in range(n_time):
-            f_variance_tile[p, i] = f_variance[i]
-
-    # Floor variance to avoid numerical issues
-    variance_paths = f_variance_tile * np.exp(exponent)
-    min_variance = 1e-6 * np.mean(f_variance)
-    variance_paths = np.maximum(variance_paths, min_variance)
+    variance_paths = np.broadcast_to(f_variance[None, :], exponent.shape) * np.exp(
+        exponent
+    )
+    variance_paths = np.maximum(variance_paths, 1e-6 * f_variance.mean())
 
     # ------------------------------------------------------------------ #
     # Stock price process (Euler–Maruyama on log)
     # ------------------------------------------------------------------ #
 
     sqrt_variance = np.sqrt(variance_paths[:, :-1])
-    short_rates_tile = np.zeros((n_paths, n_steps))
-    for p in prange(n_paths):
-        for i in range(n_steps):
-            short_rates_tile[p, i] = short_rates[i]
 
-    drift = (short_rates_tile - 0.5 * variance_paths[:, :-1]) * dt
+    short_rates = np.broadcast_to(short_rates[:n_steps], sqrt_variance.shape)
+    drift = (short_rates - 0.5 * variance_paths[:, :-1]) * dt
     diffusion = sqrt_variance * delta_ws[:, 1:]
     d_log_s = drift + diffusion
 
     # Cumulative sum per path (parallel)
-    log_s_cum = np.zeros_like(d_log_s)
-    for p in prange(n_paths):
-        cum = 0.0
-        for i in range(n_steps):
-            cum += d_log_s[p, i]
-            log_s_cum[p, i] = cum
+    log_s_cum = np.zeros((n_paths, n_steps + 1), dtype=np.float64)
 
     for p in prange(n_paths):
-        for i in range(1, n_time):
-            s_paths[p, i] = np.exp(log_s_cum[p, i - 1])
+        acc = 0.0
+        for i in range(n_steps):
+            acc += d_log_s[p, i].item()
+            log_s_cum[p, i + 1] = acc
+
+    s_paths[:, 0] = 1.0
+    s_paths[:, 1:] = np.exp(log_s_cum[:, 1:])
 
     return s_paths, variance_paths
 
@@ -433,7 +419,7 @@ class RoughBergomiEngine:
             bounds_error=False,
             fill_value=(
                 float(self.df["forward_variance"].iloc[0]),
-                float(self.df["forward_variance"].iloc[-1])
+                float(self.df["forward_variance"].iloc[-1]),
             ),
         )
 
@@ -700,7 +686,7 @@ class RoughBergomiEngine:
         # ----------------------------------------------------------------- #
         # Objective: relative pricing errors + regularization
         # ----------------------------------------------------------------- #
-        bounds = ([0.01, 0.01, -0.99], [10.0, 0.25, -0.30])
+        bounds = ([0.3, 0.01, -0.99], [6.0, 0.25, -0.50])
         # Pre-generate shared randomness for calibration to make the objective deterministic
         n_paths = self.cfg.calibration.n_paths
         n_steps = self.cfg.calibration.n_steps
@@ -969,7 +955,8 @@ class CalibrationResult:
 
         return {
             "Optimal Params": self.optimal_params,
-            "RMSE": self.rmse,
+            "RMSE_bps": round(self.rmse * 100, 2),
+            "RMSE_vol": round(self.rmse, 4),
             "Convergence": conv,
         }
 
@@ -1038,7 +1025,7 @@ def main(cfg: DictConfig):
                 )
                 # Verify put-call parity as a sanity check
                 parity_diff = abs(
-                    (target_call_prices[m, k] - target_put_prices[m, k]) 
+                    (target_call_prices[m, k] - target_put_prices[m, k])
                     - (1.0 - strike * np.exp(-r * maturity))
                 )
                 if parity_diff > 1e-6:
