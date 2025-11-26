@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - data_processor
+  - select_date
 
 forward_variance:
   minimum_points: 5

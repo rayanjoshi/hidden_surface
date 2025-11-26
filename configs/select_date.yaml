@@ -1,0 +1,7 @@
+defaults:
+  - _self_
+  - data_processor
+
+select_date:
+  date: '2020-02-04'
+  output_path: data/processed/processed_data_${select_date.date}.csv

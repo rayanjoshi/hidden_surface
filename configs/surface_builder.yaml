@@ -1,6 +1,6 @@
 defaults:
 - _self_
-- data_processor
+- select_date
 
 surface_builder:
   n_maturity_bins: 50
