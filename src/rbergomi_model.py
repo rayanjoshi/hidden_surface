@@ -347,11 +347,11 @@ def simulate_rbergomi_paths(
 
     # ------------------------------------------------------------------ #
     # Variance process (log-normal rough vol)
-    # V_t = ξ_t(0) * exp(η √(2H) W^H_t - (1/2) η² t^(2H))
+    # V_t = ξ_t(0) * exp(η √(2H) W^H_t - η² t^(2H))
     # where the √(2H) factor is part of the Riemann-Liouville fBm definition
     # ------------------------------------------------------------------ #
 
-    exponent = eta * np.sqrt(2 * hurst) * w - 0.5 * (eta**2) * t_2h_tile
+    exponent = eta * np.sqrt(2 * hurst) * w - (eta**2) * t_2h_tile
     # Prevent overflow/underflow
     for p in prange(n_paths):
         for i in range(n_time):
@@ -578,7 +578,7 @@ class RoughBergomiEngine:
         eta, hurst, rho = params
         alpha = hurst - 0.5
         n_steps = (
-            4096 if max(maturities) < 0.1 else n_steps
+            8196 if max(maturities) < 0.1 else n_steps
         )  # finer grid for short maturities
 
         max_t = max(maturities)
@@ -707,7 +707,7 @@ class RoughBergomiEngine:
         # ----------------------------------------------------------------- #
         # Objective: relative pricing errors + regularization
         # ----------------------------------------------------------------- #
-        bounds = ([0.01, 0.001, -0.999], [2.0, 0.49, 0.95])
+        bounds = ([0.01, 0.01, -0.99], [10.0, 0.25, -0.30])
         # Pre-generate shared randomness for calibration to make the objective deterministic
         n_paths = self.cfg.calibration.n_paths
         n_steps = self.cfg.calibration.n_steps
@@ -897,7 +897,6 @@ class CalibrationResult:
             return
 
         fig, ax = plt.subplots()
-        _unused = fig
         ax.plot(self.market_ivs.flatten(), label="Market IV")
         ax.plot(self.fitted_ivs.flatten(), label="Model IV")
         ax.legend()
@@ -1008,7 +1007,7 @@ def main(cfg: DictConfig):
     maturities_path = Path(repo_root / cfg.iv_surface.maturities_path).resolve()
 
     maturities = np.load(maturities_path)
-    initial_params = np.array([1.5, 0.05, -0.95])  # Initial guess for [eta, hurst, rho]
+    initial_params = np.array([3.5, 0.07, -0.8])  # Initial guess for [eta, hurst, rho]
     logger.info(f"Initial parameters: {initial_params}")
 
     logger.info("Pricing options...")
