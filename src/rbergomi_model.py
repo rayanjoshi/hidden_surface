@@ -333,7 +333,7 @@ def simulate_rbergomi_paths(
         w[p] = K @ delta_w1[p]
     w = w * (dt**alpha)  # scale w by dt**alpha
 
-    # # Time grid (Numba-compatible)
+    # Time grid
     t = np.empty(n_time)
     for i in range(n_time):
         t[i] = i * dt
@@ -352,13 +352,9 @@ def simulate_rbergomi_paths(
     # ------------------------------------------------------------------ #
 
     exponent = eta * np.sqrt(2 * hurst) * w - (eta**2) * t_2h_tile
+    
     # Prevent overflow/underflow
-    for p in prange(n_paths):
-        for i in range(n_time):
-            if exponent[p, i] > 100.0:
-                exponent[p, i] = 100.0
-            elif exponent[p, i] < -100.0:
-                exponent[p, i] = -100.0
+    exponent = np.clip(exponent, -100.0, 100.0)
 
     f_variance_tile = np.zeros((n_paths, n_time))
     for p in prange(n_paths):
@@ -368,10 +364,7 @@ def simulate_rbergomi_paths(
     # Floor variance to avoid numerical issues
     variance_paths = f_variance_tile * np.exp(exponent)
     min_variance = 1e-6 * np.mean(f_variance)
-    for p in prange(n_paths):
-        for i in range(n_time):
-            if variance_paths[p, i] < min_variance:
-                variance_paths[p, i] = min_variance
+    variance_paths = np.maximum(variance_paths, min_variance)
 
     # ------------------------------------------------------------------ #
     # Stock price process (Euler–Maruyama on log)
