@@ -569,9 +569,13 @@ class RoughBergomiEngine:
         short_rates = np.asarray(self.get_short_rate(t), dtype=float)
 
         if np.any(xi <= 0) or np.any(np.isnan(xi)):
-            self.logger.error(f"Invalid forward variance values: {xi}")
+            self.logger.error("Invalid forward variance values: %s", xi)
             raise ValueError("Forward variance contains non-positive or NaN values")
-        self.logger.info(f"Forward variance shape: {xi.shape}, values: {xi[:5]}...")
+        self.logger.info(
+            "Forward variance shape: %s, values: %s...",
+            xi.shape,
+            xi[:5],
+        )
 
         # --------------------- Antithetic variates --------------------- #
         # Optionally reuse precomputed normals for calibration stability
@@ -667,7 +671,8 @@ class RoughBergomiEngine:
             CalibrationResult object containing optimal parameters and fit metrics.
         """
         # Filter very short maturities (numerically unstable)
-        valid_indices = maturities >= 0.01
+        maturities_filter = self.cfg.calibration.maturities_filter
+        valid_indices = maturities >= maturities_filter
         filtered_maturities = maturities[valid_indices]
 
         # Ensure target price arrays are present; if None, replace with NaN arrays
@@ -681,12 +686,14 @@ class RoughBergomiEngine:
         filtered_call_prices = target_call_prices[valid_indices]
         filtered_put_prices = target_put_prices[valid_indices]
         filtered_strikes = strikes
-        self.logger.info(f"Filtered to {len(filtered_maturities)} maturities >= 0.01")
+        self.logger.info(
+            "Filtered to %d maturities >= %s", len(filtered_maturities), maturities_filter
+        )
 
         # ----------------------------------------------------------------- #
         # Objective: relative pricing errors + regularization
         # ----------------------------------------------------------------- #
-        bounds = ([0.3, 0.01, -0.99], [6.0, 0.25, -0.50])
+        bounds = ([0.1, 0.005, -1.0], [10.0, 0.20, -0.10])
         # Pre-generate shared randomness for calibration to make the objective deterministic
         n_paths = self.cfg.calibration.n_paths
         n_steps = self.cfg.calibration.n_steps
@@ -990,7 +997,7 @@ def main(cfg: DictConfig):
 
     maturities = np.load(maturities_path)
     initial_params = np.array([3.5, 0.07, -0.8])  # Initial guess for [eta, hurst, rho]
-    logger.info(f"Initial parameters: {initial_params}")
+    logger.info("Initial parameters: %s", initial_params)
 
     logger.info("Pricing options...")
     option_prices = rbergomi_model.price_options(
@@ -1001,7 +1008,7 @@ def main(cfg: DictConfig):
         n_steps=2048,
         return_iv=False,
     )
-    logger.info(f"Option prices:\n{option_prices}")
+    logger.info("Option prices:\n%s", option_prices)
 
     logger.info("Calibrating model...")
     # Convert market IV surface to model prices
@@ -1048,16 +1055,16 @@ def main(cfg: DictConfig):
 
     logger.info("Generating calibration report...")
     report = calibration_result.generate_report()
-    logger.info(f"Calibration report:\n{report}")
+    logger.info("Calibration report:\n%s", report)
 
     report_file = calibration_result.save_path / "calibration_report.json"
     with open(report_file, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=4, default=str)
-    logger.info(f"Calibration report saved to {report_file}")
+    logger.info("Calibration report saved to %s", report_file)
 
     logger.info("Plotting fit quality...")
     calibration_result.plot_fit_quality()
-    logger.info(f"Plots saved to {calibration_result.save_path}")
+    logger.info("Plots saved to %s", calibration_result.save_path)
 
     logger.info("Rough Bergomi model calculation completed.")
 
