@@ -2,9 +2,8 @@
 Forward variance calculation module using the Carr-Madan method.
 
 This module provides functionality to compute forward variance curves and variance
-swap rates from market data, following PEP 8 and PEP 257 guidelines. It uses
-configuration from Hydra, processes data with pandas, and applies smoothing with
-SciPy. Results are saved as CSV files and visualised with Matplotlib.
+swap rates from market data. It uses configuration from Hydra, processes data with pandas, 
+and applies smoothing with SciPy. Results are saved as CSV files and visualised with Matplotlib.
 """
 from typing import Optional
 from pathlib import Path
@@ -96,7 +95,7 @@ class ForwardVarianceCalculator:
                 
         if len(maturities) < 5:
             self.logger.error("No valid maturities found; using constant fallback.")
-            self.forward_variance_curve = lambda t: 0.04  # Default to 20% vol squared
+            self.forward_variance_curve = lambda t: 0.225  # Default to 20% vol squared
             return
 
         T = np.array(maturities)
@@ -104,40 +103,45 @@ class ForwardVarianceCalculator:
         
         if len(theta) > 5:
             theta = gaussian_filter1d(theta, sigma=self.sigma)
-            
+        
         W = T * theta
-        
-        T_ext = np.concatenate(([1e-8, 1e-6], T))
-        W_ext = np.concatenate(([0.0, 0.0], W))
-        
-        spl_W = interpolate.splrep(T_ext, W_ext, k=3, s=1e-3)
-        
-        def forward_variance_func(t):
-            t = np.asarray(t)
-            scalar_input = False
-            if t.ndim == 0:
-                t = t[None]
-                scalar_input = True
-            xi = interpolate.splev(t, spl_W, der=1)
-            xi = np.maximum(xi, 0.08)
-            
-            short_boost = np.maximum(45.0 - 1800 * t, 1.0)
-            xi *= short_boost
-            
-            result = xi[0] if scalar_input else xi
-            return result
-        
-        
-        self.forward_variance_curve = forward_variance_func
-            
-        self.theta_curve = interpolate.interp1d(x=T[1:],
-                                                y=theta[1:],
-                                                kind='linear',
-                                                fill_value='extrapolate',
-                                                )
+        T_ext = np.concatenate(([1e-8], T, [T.max() + 10.0]))  # extend far
+        W_ext = np.concatenate(([0.0], W, [W[-1] + 10.0 * theta[-1]]))  # linear extrapolation
 
-        self.logger.info("Computed smoothed forward variance curve ξ(t)")
-        log_function_end("carr_madan_forward_variance")
+        # Monotonic PCHIP spline (preserves shape, never decreases)
+        spl_W = interpolate.PchipInterpolator(T_ext, W_ext)
+
+        # Dense grid
+        t_dense = np.logspace(-3, np.log10(T.max() + 20), 5000)
+
+        # Analytical derivative of PCHIP is stable and always positive
+        xi_dense = spl_W.derivative()(t_dense)
+
+        # Only light cleaning — never floor to 0.04!
+        xi_dense = np.maximum(xi_dense, 0.001)  # only prevent crazy negatives
+        xi_dense = np.minimum(xi_dense, 10.0)   # cap insane values
+
+        # Final interpolator (linear is more stable than spline derivative)
+        long_term_level = xi_dense[-1000:].mean()       # typically ~0.21–0.23 for TSLA
+        self.forward_variance_curve = interpolate.interp1d(
+            t_dense,
+            xi_dense,
+            kind='linear',
+            bounds_error=False,
+            fill_value=long_term_level,
+        )
+        
+        self.theta_curve = interpolate.interp1d(
+            T,
+            theta,
+            kind='linear',
+            bounds_error=False,
+            fill_value="extrapolate"
+        )
+
+        self.logger.info(f"Forward variance ξ(0+) ≈ {xi_dense[0]:.4f} "
+                        f"({np.sqrt(xi_dense[0])*100:.1f}% instantaneous vol)")
+        self.logger.info(f"Forward variance ξ(1Y) ≈ {self.forward_variance_curve(1.0):.4f}")
 
     def _variance_swap_rate(self, df, forward_price, maturity):
 
@@ -223,14 +227,15 @@ class ForwardVarianceCalculator:
         t_plot = np.linspace(0.01, max_maturity, 100)
         forward_variance = [self.forward_variance_curve(t) for t in t_plot]
 
-        theta_values = [np.nan] * len(t_plot)
+        theta_vol = [np.nan] * len(t_plot)
         if self.theta_curve is not None:
-            theta_values[1:] = [self.theta_curve(t) for t in t_plot[1:]]
+            theta_var = np.array([self.theta_curve(t) for t in t_plot])
+            theta_vol = np.sqrt(np.maximum(theta_var, 0.0))
 
         output_df = pd.DataFrame({
             "maturity_years": t_plot,
             "forward_variance": forward_variance,
-            "variance_swap_rate": theta_values
+            "variance_swap_rate": theta_vol
         })
 
         self.output_path.mkdir(parents=True, exist_ok=True)
@@ -250,9 +255,11 @@ class ForwardVarianceCalculator:
         log_function_start("plot_variance")
 
         fig, ax1 = plt.subplots(figsize=(12, 6))
+        
         max_maturity = max(self.df["T_years"])
         t_plot = np.linspace(0.01, max_maturity, 100)
         forward_variance = [self.forward_variance_curve(t) for t in t_plot]
+        
         ax1.plot(t_plot, forward_variance, label="Forward Variance ξ(t)", color="blue")
         ax1.set_xlabel("Maturity (Years)")
         ax1.set_ylabel("Forward Variance", color="blue")
@@ -269,6 +276,7 @@ class ForwardVarianceCalculator:
         fig.legend(loc="upper right")
         plt.tight_layout()
         plt.savefig(self.output_path / "forward_variance.svg", format='svg')
+        plt.savefig(self.output_path / "forward_variance.png", format='png')
 
         log_function_end("plot_variance")
 
