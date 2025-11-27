@@ -870,6 +870,7 @@ class CalibrationResult:
     def plot_fit_quality(self) -> None:
         """
         Plot market vs. model implied volatilities.
+        Saves plot and data to the configured save path.
         """
         if self.market_ivs is None or self.fitted_ivs is None:
             self.logger.warning("Cannot plot - IV surfaces not computed")
@@ -886,6 +887,8 @@ class CalibrationResult:
         self.save_path.mkdir(parents=True, exist_ok=True)
         self.save_path = self.save_path / "market_vs_model_iv.svg"
         plt.savefig(self.save_path, format="svg")
+        np.save(self.save_path.with_name("fitted_ivs.npy"), self.fitted_ivs)
+        np.save(self.save_path.with_name("market_ivs.npy"), self.market_ivs)
 
     def generate_report(self) -> Dict:
         """
@@ -955,8 +958,7 @@ class CalibrationResult:
 
         return {
             "Optimal Params": self.optimal_params,
-            "RMSE_bps": round(self.rmse * 100, 2),
-            "RMSE_vol": round(self.rmse, 4),
+            "RMSE_IV": round(self.rmse, 4),
             "Convergence": conv,
         }
 
