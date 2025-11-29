@@ -3,6 +3,8 @@ defaults:
   - select_date
 
 forward_variance:
-  minimum_points: 5
-  sigma: 0.5
+  minimum_points: 5  # Minimum data points required for forward variance calculation
+  n_knots: 10  # Number of internal spline knots for ξ(t) parametrisation
+  regularisation_lambda: 0.01  # Smoothness penalty λ for ∫(s''(t))² dt
+  
   output_path: "data/forward_variance"
