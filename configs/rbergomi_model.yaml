@@ -10,10 +10,9 @@ iv_surface:
 rbergomi:
   save_path: "data/rbergomi_model"
 
-seed: 42  # Random seed for reproducibility
+seed: 42  # Fixed seed for reproducible calibration (deterministic Monte Carlo)
 
 calibration:
   n_paths: 65536  # Number of Monte Carlo paths for calibration
   n_steps: 1024    # Number of time steps for calibration
-  regularisation_weight: 0.0005  # Weight for regularization term in calibration objective
   maturities_filter: 0.01  # Minimum maturity to consider in calibration (in years)

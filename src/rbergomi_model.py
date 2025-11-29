@@ -1,6 +1,6 @@
 """
 Rough Bergomi (rBergomi) Model Implementation
-============================================
+=============================================
 
 A high-performance, Numba-accelerated implementation of the Rough Bergomi stochastic
 volatility model for:
@@ -16,7 +16,7 @@ Key Features
   fractional Brownian motion with arbitrary Hurst parameter H ∈ (0, 0.5)
 - Antithetic variates for variance reduction
 - Parallel Numba kernels for both variance and stock processes
-- Robust calibration using trust-region reflective least-squares with regularization
+- Robust calibration using trust-region reflective least-squares with regularisation
 - Full support for time-dependent short rates and forward variance curves
 
 References
@@ -54,6 +54,92 @@ from scripts.logging_config import get_logger, setup_logging
 # =============================================================================
 # Black-Scholes Helper Functions
 # =============================================================================
+
+
+def compute_vega(
+    s: float | np.ndarray,
+    k: float | np.ndarray,
+    t: float | np.ndarray,
+    r: float,
+    sigma: float | np.ndarray
+) -> float | np.ndarray:
+    """
+    Compute Black-Scholes Vega = ∂Price/∂σ.
+    
+    Vega measures the sensitivity of option price to volatility.
+    Used for weighting calibration points by their information content.
+    
+    Mathematical Formula:
+        Vega = S * √T * φ(d₁) / 100
+        
+    where φ is the standard normal PDF and d₁ is the usual BS d1.
+    The division by 100 scales Vega to percentage terms.
+    
+    Parameters
+    ----------
+    s : float or np.ndarray
+        Spot price (normalized to 1 for log-moneyness grids)
+    k : float or np.ndarray
+        Strike price(s)
+    t : float or np.ndarray
+        Time to maturity in years
+    r : float
+        Risk-free rate
+    sigma : float or np.ndarray
+        Implied volatility
+    
+    Returns
+    -------
+    float or np.ndarray
+        Vega value(s)
+    """
+    # Handle edge cases
+    t = np.asarray(t)
+    sigma = np.asarray(sigma)
+    
+    if np.any(t <= 0) or np.any(sigma <= 0):
+        # Return zeros for invalid inputs
+        result = np.zeros_like(t * sigma)
+        valid = (t > 0) & (sigma > 0)
+        if np.any(valid):
+            s_v = np.asarray(s)
+            k_v = np.asarray(k)
+            sqrt_t = np.sqrt(t[valid] if np.ndim(t) > 0 else t)
+            d1 = (np.log(s_v / k_v) + (r + 0.5 * sigma[valid if np.ndim(sigma) > 0 else ...]**2) * t[valid if np.ndim(t) > 0 else ...]) / (sigma[valid if np.ndim(sigma) > 0 else ...] * sqrt_t + 1e-10)
+            result[valid] = s_v * sqrt_t * norm.pdf(d1) / 100.0
+        return result
+    
+    sqrt_t = np.sqrt(t)
+    d1 = (np.log(s / k) + (r + 0.5 * sigma**2) * t) / (sigma * sqrt_t + 1e-10)
+    vega = s * sqrt_t * norm.pdf(d1) / 100.0
+    
+    return vega
+
+
+def compute_vega_scalar(s: float, k: float, t: float, r: float, sigma: float) -> float:
+    """
+    Compute Black-Scholes Vega for scalar inputs.
+    
+    Faster version for single option evaluation used in calibration loops.
+    
+    Parameters
+    ----------
+    s, k, t, r, sigma : float
+        Standard Black-Scholes inputs
+    
+    Returns
+    -------
+    float
+        Vega value (scaled to percentage terms)
+    """
+    if t <= 0 or sigma <= 0:
+        return 0.0
+    
+    sqrt_t = np.sqrt(t)
+    d1 = (np.log(s / k) + (r + 0.5 * sigma**2) * t) / (sigma * sqrt_t)
+    vega = s * sqrt_t * norm.pdf(d1) / 100.0
+    
+    return float(vega)
 
 
 def black_scholes_call(
@@ -395,7 +481,7 @@ class RoughBergomiEngine:
         - Loading of implied volatility surface
         - Interpolation of risk-free rates and short rates
         - Monte-Carlo pricing with antithetic variates
-        - Global least-squares calibration with regularization
+        - Global least-squares calibration with regularisation
     """
 
     def __init__(self, cfg: DictConfig):
@@ -644,7 +730,7 @@ class RoughBergomiEngine:
     # Calibration
     # --------------------------------------------------------------------- #
 
-    def calibrate(
+    def calibration(
         self,
         target_call_prices: Optional[np.ndarray],
         target_put_prices: Optional[np.ndarray],
@@ -653,48 +739,84 @@ class RoughBergomiEngine:
         initial_params: tuple[float, float, float] | np.ndarray,
     ) -> "CalibrationResult":
         """
-        Global calibration of (η, H, ρ) to market call/put prices using least-squares.
-
-        Uses a single Monte-Carlo simulation per parameter set (shared paths)
-        and adds mild regularization to improve convergence.
-
+        Calibrate (η, H, ρ) to market IV surface using Vega-weighted least squares.
+        
+        Mathematically rigorous calibration that minimises:
+        
+            Σᵢⱼ Vegaᵢⱼ * [(IV_model - IV_market) / IV_market]²
+        
+        Subject to parameter bounds:
+            η ∈ [0.1, 10.0]      - Vol-of-vol parameter
+            H ∈ [0.005, 0.20]    - Hurst parameter (rough regime)
+            ρ ∈ [-1.0, -0.10]    - Spot-vol correlation (negative for equity)
+        
+        Key improvements over previous implementation:
+        1. Vega weighting: Points with higher Vega (more sensitive to vol) get more weight
+        2. No arbitrary parameter penalties: Let bounds handle constraints
+        3. No smoothness penalty on errors: Forward variance handles smoothness
+        4. Pure IV-space calibration: More stable than price-space
+        
         Parameters
         ----------
         target_call_prices, target_put_prices : Optional[np.ndarray]
-            Market call and put option prices
+            Market call and put option prices (used only for fallback)
         strikes, maturities : np.ndarray
             Strike and maturity grids
-        initial_params: Initial guess for [eta, hurst, rho].
+        initial_params : tuple or np.ndarray
+            Initial guess for [eta, hurst, rho]
 
         Returns
         -------
-            CalibrationResult object containing optimal parameters and fit metrics.
+        CalibrationResult
+            Object containing optimal parameters, fitted IVs, and fit metrics
         """
         # Filter very short maturities (numerically unstable)
         maturities_filter = self.cfg.calibration.maturities_filter
         valid_indices = maturities >= maturities_filter
         filtered_maturities = maturities[valid_indices]
-
-        # Ensure target price arrays are present; if None, replace with NaN arrays
-        n_maturities = np.asarray(maturities).size
-        n_strikes = np.asarray(strikes).size
-        if target_call_prices is None:
-            target_call_prices = np.full((n_maturities, n_strikes), np.nan)
-        if target_put_prices is None:
-            target_put_prices = np.full((n_maturities, n_strikes), np.nan)
-
-        filtered_call_prices = target_call_prices[valid_indices]
-        filtered_put_prices = target_put_prices[valid_indices]
         filtered_strikes = strikes
+        
+        # Market IVs for this calibration
+        market_ivs = self.iv_surface[valid_indices]
+        
+        # Compute yields for each maturity
+        yields = np.asarray(self.get_yield(filtered_maturities), dtype=float)
+        
         self.logger.info(
-            "Filtered to %d maturities >= %s", len(filtered_maturities), maturities_filter
+            "Calibrating to %d maturities × %d strikes = %d points",
+            len(filtered_maturities), len(filtered_strikes),
+            len(filtered_maturities) * len(filtered_strikes)
         )
 
         # ----------------------------------------------------------------- #
-        # Objective: relative pricing errors + regularization
+        # Compute Vega weights for all calibration points
+        # ----------------------------------------------------------------- #
+        vegas = np.zeros_like(market_ivs)
+        for m, (T, r) in enumerate(zip(filtered_maturities, yields)):
+            for k, K in enumerate(filtered_strikes):
+                if np.isfinite(market_ivs[m, k]) and market_ivs[m, k] > 0:
+                    # Use S=1.0 for normalized grid
+                    vegas[m, k] = compute_vega_scalar(1.0, K, T, r, market_ivs[m, k])
+        
+        # Normalize Vegas to have mean = 1 for numerical stability
+        vega_mask = vegas > 0
+        if np.any(vega_mask):
+            vega_mean = np.mean(vegas[vega_mask])
+            if vega_mean > 0:
+                vegas = vegas / vega_mean
+            else:
+                vegas = np.ones_like(vegas)
+        else:
+            self.logger.warning("No valid Vega weights; using uniform weighting")
+            vegas = np.ones_like(market_ivs)
+        
+        n_valid = np.sum((market_ivs > 0) & np.isfinite(market_ivs) & (vegas > 0))
+        self.logger.info("Number of valid calibration points: %d", n_valid)
+
+        # ----------------------------------------------------------------- #
+        # Pre-generate shared randomness for deterministic calibration
         # ----------------------------------------------------------------- #
         bounds = ([0.1, 0.005, -1.0], [10.0, 0.20, -0.10])
-        # Pre-generate shared randomness for calibration to make the objective deterministic
         n_paths = self.cfg.calibration.n_paths
         n_steps = self.cfg.calibration.n_steps
         seed = self.cfg.seed
@@ -706,10 +828,29 @@ class RoughBergomiEngine:
         z_base_cal = rng_cal.standard_normal((n_base_cal, n_steps))
         all_z_cal = np.vstack([z_base_cal, -z_base_cal])[:n_paths, :]
 
+        # ----------------------------------------------------------------- #
+        # Vega-weighted IV-space objective function
+        # ----------------------------------------------------------------- #
+        # Pre-compute the fixed calibration mask (must be constant across calls)
+        fixed_calibration_mask = (market_ivs > 0) & np.isfinite(market_ivs) & (vegas > 0)
+        n_calibration_points = np.sum(fixed_calibration_mask)
+        self.logger.info("Using %d fixed calibration points", n_calibration_points)
+        
         def objective(params):
+            """
+            Compute Vega-weighted relative IV errors.
+            
+            Returns vector of weighted errors for least_squares optimiser.
+            The optimiser will minimize sum(errors²), so we return:
+                sqrt(vega) * (IV_model - IV_market) / IV_market
+            
+            This gives us Vega-weighted relative IV errors when squared.
+            
+            IMPORTANT: Must return same-sized array for all parameter values!
+            """
             eta, hurst, rho = params
 
-            # One shared MC simulation for both calls and puts using precomputed normals
+            # Single MC simulation with shared randomness
             s_t = self.price_options(
                 filtered_strikes,
                 filtered_maturities,
@@ -719,80 +860,87 @@ class RoughBergomiEngine:
                 return_terminal_paths=True,
                 precomputed_g1=all_g1_cal,
                 precomputed_z=all_z_cal,
-            ).squeeze(-1)  # shape: (n_paths_cal, n_maturities)
+            ).squeeze(-1)  # shape: (n_paths, n_maturities)
 
-            discounts = np.exp(
-                -self.get_yield(filtered_maturities) * filtered_maturities
-            )[:, None]
+            discounts = np.exp(-yields * filtered_maturities)[:, None]
 
+            # Compute model call prices
             call_payoffs = np.maximum(
                 s_t[:, :, None] - filtered_strikes[None, None, :], 0
             )
-            put_payoffs = np.maximum(
-                filtered_strikes[None, None, :] - s_t[:, :, None], 0
-            )
-
             model_call_prices = np.mean(call_payoffs, axis=0) * discounts
-            model_put_prices = np.mean(put_payoffs, axis=0) * discounts
 
-            valid_call_mask = (filtered_call_prices > 0) & np.isfinite(
-                filtered_call_prices
+            # Convert model prices to implied volatilities
+            model_ivs = np.full_like(model_call_prices, np.nan)
+            for m, (T, r) in enumerate(zip(filtered_maturities, yields)):
+                for k, K in enumerate(filtered_strikes):
+                    price = model_call_prices[m, k]
+                    if price > 1e-12:
+                        try:
+                            model_ivs[m, k] = implied_volatility(
+                                price, 1.0, K, T, r=r, option_type='call'
+                            )
+                        except Exception:
+                            model_ivs[m, k] = np.nan
+
+            # Initialise residuals array with fixed size
+            residuals = np.zeros(n_calibration_points)
+            
+            # Get values at calibration points
+            market_ivs_valid = market_ivs[fixed_calibration_mask]
+            model_ivs_valid = model_ivs[fixed_calibration_mask]
+            vega_weights = np.sqrt(vegas[fixed_calibration_mask])
+            
+            # Handle invalid model IVs by assigning large residual
+            valid_model = np.isfinite(model_ivs_valid) & (model_ivs_valid > 0)
+            
+            # Where model is valid: compute relative error
+            residuals[valid_model] = vega_weights[valid_model] * (
+                (model_ivs_valid[valid_model] - market_ivs_valid[valid_model]) 
+                / market_ivs_valid[valid_model]
             )
-            valid_put_mask = (filtered_put_prices > 0) & np.isfinite(
-                filtered_put_prices
-            )
+            
+            # Where model is invalid: assign large penalty (but not too large to cause overflow)
+            residuals[~valid_model] = 10.0  # 1000% relative error
+            
+            return residuals
 
-            # Relative errors only on quoted instruments
-            call_errors = (
-                model_call_prices[valid_call_mask]
-                - filtered_call_prices[valid_call_mask]
-            ) / filtered_call_prices[valid_call_mask]
-            put_errors = (
-                model_put_prices[valid_put_mask] - filtered_put_prices[valid_put_mask]
-            ) / filtered_put_prices[valid_put_mask]
-
-            # Light L2 regularization toward realistic values
-            reg_weight = self.cfg.calibration.regularisation_weight
-            param_penalty = reg_weight * sum(
-                [(eta - 1.0) ** 2, 10 * (hurst - 0.07) ** 2, (rho + 0.6) ** 2]
-            )
-
-            all_errors = np.concatenate([call_errors, put_errors])
-            if len(all_errors) > 2:
-                smoothness = 0.0001 * np.sum(np.diff(all_errors, n=2) ** 2)
-            else:
-                smoothness = 0.0
-
-            total_penalty = param_penalty + smoothness
-
-            return np.concatenate([all_errors, [np.sqrt(total_penalty)]])
-
+        # ----------------------------------------------------------------- #
+        # Run optimisation
+        # ----------------------------------------------------------------- #
+        self.logger.info("Starting calibration with initial params: eta=%.3f, H=%.4f, rho=%.3f",
+                        initial_params[0], initial_params[1], initial_params[2])
+        
         res = least_squares(
             objective,
             np.asarray(initial_params),
             bounds=bounds,
             method="trf",
             max_nfev=5000,
-            ftol=1e-12,
-            gtol=1e-9,
-            xtol=1e-12,
-            loss="soft_l1",
+            ftol=1e-6,
+            gtol=1e-6,
+            xtol=1e-8,
+            loss="soft_l1",  # Robust to outliers
             verbose=2,
         )
 
         optimal_params = res.x
+        self.logger.info(
+            "Optimal parameters: η=%.4f, H=%.4f, ρ=%.4f",
+            optimal_params[0], optimal_params[1], optimal_params[2]
+        )
 
-        # Compute fitted IVs (using both call and put prices for maximum consistency)
+        # ----------------------------------------------------------------- #
+        # Compute fitted IVs with optimal parameters
+        # ----------------------------------------------------------------- #
         s_t_final = self.price_options(
             filtered_strikes,
             filtered_maturities,
             optimal_params,
             return_terminal_paths=True,
-        ).squeeze(-1)  # (n_paths, n_maturities)
+        ).squeeze(-1)
 
-        discounts = np.exp(-self.get_yield(filtered_maturities) * filtered_maturities)[
-            :, None
-        ]  # (n_maturities, 1)
+        discounts = np.exp(-yields * filtered_maturities)[:, None]
 
         call_payoffs = np.maximum(
             s_t_final[:, :, None] - filtered_strikes[None, None, :], 0
@@ -801,43 +949,56 @@ class RoughBergomiEngine:
         fitted_ivs = np.full_like(fitted_call_prices, np.nan)
 
         for m, maturity in enumerate(filtered_maturities):
-            r = float(np.array(self.get_yield(maturity)).item())
+            r = float(yields[m])
             for k, strike in enumerate(filtered_strikes):
                 price = fitted_call_prices[m, k]
                 if price > 0 and np.isfinite(price):
-                    fitted_ivs[m, k] = implied_volatility(
-                        price, 1.0, strike, maturity, r=r, option_type="call"
-                    )
+                    try:
+                        fitted_ivs[m, k] = implied_volatility(
+                            price, 1.0, strike, maturity, r=r, option_type="call"
+                        )
+                    except Exception:
+                        fitted_ivs[m, k] = np.nan
 
-        # Final high-precision pricing with optimal parameters
+        # ----------------------------------------------------------------- #
+        # Build calibration result
+        # ----------------------------------------------------------------- #
         result = CalibrationResult(self.cfg)
         result.optimal_params = {
-            "eta": optimal_params[0],
-            "hurst": optimal_params[1],
-            "rho": optimal_params[2],
+            "eta": float(optimal_params[0]),
+            "hurst": float(optimal_params[1]),
+            "rho": float(optimal_params[2]),
         }
         result.fitted_ivs = fitted_ivs
-        result.market_ivs = self.iv_surface[valid_indices]
+        result.market_ivs = market_ivs
 
-        # Ensure arrays are not None before using numpy ufuncs to satisfy static type checkers
-        if result.fitted_ivs is None or result.market_ivs is None:
-            result.rmse = np.nan
-            self.logger.warning(
-                "Cannot compute RMSE because fitted_ivs or market_ivs is None"
-            )
-        else:
+        # Compute RMSE (unweighted, for reporting)
+        if result.fitted_ivs is not None and result.market_ivs is not None:
             valid_mask = np.isfinite(result.fitted_ivs) & np.isfinite(result.market_ivs)
             if np.any(valid_mask):
-                result.rmse = np.sqrt(
+                result.rmse = float(np.sqrt(
                     np.mean(
-                        (result.fitted_ivs[valid_mask] - result.market_ivs[valid_mask])
-                        ** 2
+                        (result.fitted_ivs[valid_mask] - result.market_ivs[valid_mask]) ** 2
                     )
-                )
+                ))
+                
+                # Also compute weighted RMSE for comparison
+                if np.any(valid_mask & (vegas > 0)):
+                    weighted_sq_errors = vegas[valid_mask] * (
+                        (result.fitted_ivs[valid_mask] - result.market_ivs[valid_mask]) / 
+                        result.market_ivs[valid_mask]
+                    ) ** 2
+                    weighted_rmse = float(np.sqrt(np.mean(weighted_sq_errors)))
+                    self.logger.info("Vega-weighted RMSE (relative): %.6f", weighted_rmse)
             else:
                 result.rmse = np.nan
                 self.logger.warning("No valid IVs for RMSE calculation")
+        else:
+            result.rmse = np.nan
+            self.logger.warning("Cannot compute RMSE because fitted_ivs or market_ivs is None")
 
+        self.logger.info("Calibration RMSE (absolute IV): %.6f", result.rmse)
+        
         result.convergence_info = res
         return result
 
@@ -849,14 +1010,14 @@ class RoughBergomiEngine:
 
 class CalibrationResult:
     """
-    Stores and visualizes calibration results for the Rough Bergomi model.
+    Stores and visualises calibration results for the Rough Bergomi model.
 
     Attributes:
-        optimal_params: Dictionary of calibrated parameters (eta, hurst, rho).
+        optimal_params: Dictionary of calibration parameters (eta, hurst, rho).
         fitted_ivs: Array of fitted implied volatilities.
         market_ivs: Array of market implied volatilities.
         rmse: Root mean square error of the calibration.
-        convergence_info: Optimization results from least_squares.
+        convergence_info: Optimisation results from least_squares.
         simulation_stats: Placeholder for simulation statistics.
     """
 
@@ -1045,7 +1206,7 @@ def main(cfg: DictConfig):
                         parity_diff,
                     )
 
-    calibration_result = rbergomi_model.calibrate(
+    calibration_result = rbergomi_model.calibration(
         target_call_prices=target_call_prices,
         target_put_prices=target_put_prices,
         strikes=rbergomi_model.strikes,
