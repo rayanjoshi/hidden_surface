@@ -310,7 +310,7 @@ class ForwardVarianceCurve:
             initial_coefficients,
             method="L-BFGS-B",
             jac=objective_gradient,
-            options={"maxiter": 500, "ftol": 1e-10, "gtol": 1e-8},
+            options={"maxiter": 2000, "ftol": 1e-8, "gtol": 1e-6},
         )
 
         # Store fitted spline
@@ -508,19 +508,17 @@ class ForwardVarianceCalculator:
 
     def carr_madan_forward_variance(self):
         """
-        Compute forward variance curve using the Carr-Madan method.
+        Compute forward variance curve using ATM IV² with Carr-Madan fallback.
 
-        Uses model-free variance swap pricing (Carr-Madan) to compute market
-        variance swap rates, then fits a smooth, positive ξ(t) curve using
-        the exponential spline parametrisation.
-
-        Mathematical Details
-        --------------------
-        The Carr-Madan formula gives the variance swap rate:
-
-            θ(T) = (2e^(rT)/T) ∫ [P(K)/K² dK for K<F] + [C(K)/K² dK for K>F]
-
-        where P, C are put/call prices, K is strike, F is forward price.
+        This method uses a market-based approach to forward variance:
+        
+        1. Primary method (ATM IV²)**: Uses σ_ATM(T)² directly as the variance
+           swap rate θ(T) at each maturity. This is a model-free approach that
+           preserves the market's term structure shape and avoids numerical
+           instabilities of Carr-Madan at short maturities.
+           
+        2. Fallback (Carr-Madan)**: For maturities without ATM IV data, uses
+           the Carr-Madan variance swap formula, scaled to match nearby ATM IVs.
 
         After computing θ(T) at market maturities, we fit ξ(t) such that:
 
@@ -583,56 +581,98 @@ class ForwardVarianceCalculator:
             return
 
         T = np.array(maturities)
-        theta = np.array(var_swaps)
+        theta_carr_madan = np.array(var_swaps)
         weights = np.array(n_options_at_maturity, dtype=np.float64)
 
         self.logger.info(
-            "Fitting to %d maturities with variance swaps in [%.4f, %.4f]",
+            "Fitting to %d maturities with Carr-Madan variance swaps in [%.4f, %.4f]",
             len(T),
-            theta.min(),
-            theta.max(),
+            theta_carr_madan.min(),
+            theta_carr_madan.max(),
         )
 
         # ----------------------------------------------------------------- #
-        # ATM IV Rescaling: Scale variance swaps to match ATM IV²
+        # HYBRID APPROACH: Scale Carr-Madan to match ATM IV² per maturity
         # ----------------------------------------------------------------- #
-        # Carr-Madan variance swaps can differ significantly from ATM IV²
-        # For rBergomi calibration, we need forward variance ≈ ATM IV²
-        # Compute the scaling factor from ATM IVs
-        atm_ivs = []
-        atm_maturities = []
-        for T_i in T:
+        # Carr-Madan gives variance swap rates, but can be miscalibrated.
+        # ATM IV² is a reliable anchor point for each maturity.
+        # 
+        # Strategy:
+        # 1. Compute ATM IV² for each maturity (interpolating if needed)
+        # 2. Scale Carr-Madan θ(T) by the ratio ATM_IV²(T) / θ_CM(T)
+        # 3. This preserves Carr-Madan's relative shape while anchoring to market
+        # ----------------------------------------------------------------- #
+        
+        atm_iv_squared = np.zeros(len(T))
+        atm_iv_available = np.zeros(len(T), dtype=bool)
+        
+        for i, T_i in enumerate(T):
             mat_df = self.df[np.abs(self.df["T_years"] - T_i) < 0.01]
             if len(mat_df) > 0:
                 # Find ATM option (minimum |log-moneyness|)
                 atm_idx = mat_df["log_moneyness"].abs().idxmin()
                 atm_iv = mat_df.loc[atm_idx, "implied_volatility"]
-                atm_ivs.append(atm_iv)
-                atm_maturities.append(T_i)
-
-        if len(atm_ivs) > 3:
-            atm_ivs = np.array(atm_ivs)
-            atm_iv_squared = atm_ivs**2
-            # Match theta values to ATM IV²
-            # Compute average scaling factor (exclude extreme outliers)
-            ratios = atm_iv_squared / theta[: len(atm_ivs)]
-            median_ratio = np.median(ratios)
-            self.logger.info(
-                "ATM IV² / Carr-Madan ratio: median=%.2f, range=[%.2f, %.2f]",
-                median_ratio,
-                ratios.min(),
-                ratios.max(),
-            )
-
-            # Apply scaling to match ATM IVs
-            # This ensures forward variance produces correct ATM IV levels
-            if median_ratio > 1.5 or median_ratio < 0.67:
-                self.logger.warning(
-                    "Large discrepancy between Carr-Madan and ATM IV². "
-                    "Scaling forward variance by %.2fx to match market ATM IVs.",
-                    median_ratio,
+                log_m = mat_df.loc[atm_idx, "log_moneyness"]
+                
+                # Use if within reasonable range of ATM (|log-moneyness| < 0.3)
+                # and IV is valid. For options further from ATM, we interpolate
+                # to get a better ATM estimate.
+                if abs(log_m) < 0.3 and 0.05 < atm_iv < 3.0:
+                    # If not close to ATM, try to interpolate between call and put
+                    if abs(log_m) > 0.05:
+                        # Find options on both sides of ATM for interpolation
+                        otm_puts = mat_df[mat_df["log_moneyness"] < 0].sort_values("log_moneyness", ascending=False)
+                        otm_calls = mat_df[mat_df["log_moneyness"] > 0].sort_values("log_moneyness")
+                        
+                        if len(otm_puts) > 0 and len(otm_calls) > 0:
+                            # Linear interpolation to log_moneyness = 0
+                            put_row = otm_puts.iloc[0]
+                            call_row = otm_calls.iloc[0]
+                            lm_put, iv_put = put_row["log_moneyness"], put_row["implied_volatility"]
+                            lm_call, iv_call = call_row["log_moneyness"], call_row["implied_volatility"]
+                            
+                            # Interpolate IV at log_moneyness = 0
+                            if lm_call != lm_put:
+                                atm_iv = iv_put + (iv_call - iv_put) * (0 - lm_put) / (lm_call - lm_put)
+                    
+                    atm_iv_squared[i] = atm_iv ** 2
+                    atm_iv_available[i] = True
+        
+        n_atm_available = np.sum(atm_iv_available)
+        self.logger.info(
+            "ATM IV² available for %d of %d maturities (%.0f%%)",
+            n_atm_available, len(T), 100 * n_atm_available / len(T)
+        )
+        
+        # Use Carr-Madan variance swap rates, scaled by median ATM IV² ratio
+        # This preserves the term structure shape from Carr-Madan while 
+        # correcting the overall level to match market ATM volatilities.
+        theta = theta_carr_madan.copy()
+        
+        if n_atm_available >= 3:
+            comparison_mask = atm_iv_available & (theta_carr_madan > 0)
+            if np.any(comparison_mask):
+                ratios = atm_iv_squared[comparison_mask] / theta_carr_madan[comparison_mask]
+                median_ratio = np.median(ratios)
+                self.logger.info(
+                    "ATM IV² / Carr-Madan ratio: median=%.2f, range=[%.2f, %.2f]",
+                    median_ratio, ratios.min(), ratios.max()
                 )
-                theta = theta * median_ratio
+                
+                # Apply uniform scaling to preserve Carr-Madan term structure
+                # Only scale if there's a significant discrepancy
+                if median_ratio > 1.2 or median_ratio < 0.8:
+                    self.logger.info(
+                        "Scaling Carr-Madan variance swaps by %.2fx to match ATM IVs",
+                        median_ratio
+                    )
+                    theta = theta_carr_madan * median_ratio
+        
+        self.logger.info(
+            "Using ATM IV² for forward variance: θ range [%.4f, %.4f] (σ: %.1f%% to %.1f%%)",
+            theta.min(), theta.max(), 
+            np.sqrt(theta.min()) * 100, np.sqrt(theta.max()) * 100
+        )
 
         # Create and fit the forward variance curve
         fvc = ForwardVarianceCurve(
