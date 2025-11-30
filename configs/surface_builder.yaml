@@ -6,3 +6,19 @@ surface_builder:
   n_maturity_bins: 50
   n_moneyness_bins: 100
   output_dir: "data/iv_surface"
+  
+  # Interpolation method: "rbf" (recommended), "cubic", or "linear"
+  # RBF (Radial Basis Functions) produces C² smooth surfaces, ideal for sparse data
+  # Cubic provides C² where data exists, falls back to linear/nearest
+  # Linear is C⁰ continuous (fastest but may have kinks)
+  interpolation_method: "rbf"
+  
+  # Light Gaussian smoothing after interpolation
+  # The RBF/cubic methods already produce smooth surfaces, so this is optional
+  light_smoothing: true
+  smoothing_sigma: 0.3  # Gaussian kernel width (keep ≤ 0.3 to preserve structure)
+  
+  # Calendar arbitrage enforcement
+  # Ensures total variance is monotonically increasing with maturity
+  enforce_calendar_arbitrage: true
+  min_variance_increase: 0.0001  # Minimum TV increase per unit time step
