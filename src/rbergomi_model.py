@@ -816,7 +816,7 @@ class RoughBergomiEngine:
         # ----------------------------------------------------------------- #
         # Pre-generate shared randomness for deterministic calibration
         # ----------------------------------------------------------------- #
-        bounds = ([0.1, 0.005, -1.0], [10.0, 0.20, -0.10])
+        bounds = ([0.1, 0.005, -1.0], [10.0, 0.20, -0.01]) # η, H, ρ
         n_paths = self.cfg.calibration.n_paths
         n_steps = self.cfg.calibration.n_steps
         seed = self.cfg.seed
@@ -937,6 +937,8 @@ class RoughBergomiEngine:
             filtered_strikes,
             filtered_maturities,
             optimal_params,
+            n_paths=self.cfg.final_pricing.n_paths,
+            n_steps=self.cfg.final_pricing.n_steps,
             return_terminal_paths=True,
         ).squeeze(-1)
 

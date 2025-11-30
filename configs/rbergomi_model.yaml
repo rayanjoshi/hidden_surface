@@ -15,4 +15,8 @@ seed: 42  # Fixed seed for reproducible calibration (deterministic Monte Carlo)
 calibration:
   n_paths: 65536  # Number of Monte Carlo paths for calibration
   n_steps: 1024    # Number of time steps for calibration
-  maturities_filter: 0.01  # Minimum maturity to consider in calibration (in years)
+  maturities_filter: 0.08  # Minimum maturity to consider in calibration (in years, ~30 days)
+
+final_pricing:
+  n_paths: 131072  # Number of Monte Carlo paths for final pricing
+  n_steps: 2048    # Number of time steps for final pricing
