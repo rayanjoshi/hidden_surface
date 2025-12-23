@@ -10,13 +10,13 @@ license = { file = "LICENSE" }
 dependencies = [
     # -------- Data Handling & Visualisation -------- #
     "matplotlib",
-    "numpy",
+    "numpy<=2.4.0",
     "IPython",
     "pandas",
     "scipy",
 
     # -------- Financial Data -------- #
-    "wrds",
+    "wrds==3.4.0",
     "pandas_datareader",
 
     # -------- Utilities -------- #
@@ -26,6 +26,7 @@ dependencies = [
     "python-dotenv",
     "colorlog",
     "numba",
+    "ipykernel",
 ]
 
 [project.optional-dependencies]
