@@ -1,3 +1,6 @@
+defaults:
+  - select_date
+
 f_variance:
   output_path: "data/forward_variance/forward_variance_data.csv"
 
@@ -20,3 +23,8 @@ calibration:
 final_pricing:
   n_paths: 131072  # Number of Monte Carlo paths for final pricing
   n_steps: 2048    # Number of time steps for final pricing
+
+variance_swap:
+  # Monte Carlo parameters for variance swap pricing
+  n_paths: 100000
+  n_steps: 2048
