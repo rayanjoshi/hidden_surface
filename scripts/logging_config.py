@@ -1,7 +1,7 @@
 """Project-wide logging configuration and utilities.
 
-This module provides a centralized logging system for the project, utilizing
-customized loggers with both console and file output capabilities. It supports
+This module provides a centralised logging system for the project, utilising
+customised loggers with both console and file output capabilities. It supports
 colored console output and structured logging to a timestamped file. The module
 includes a `ProjectLogger` class for managing logger instances and convenience
 functions for easy access to logging functionality.
@@ -20,6 +20,7 @@ Dependencies:
     - inspect: For inferring module names from call stack.
     - colorlog: For colored console output formatting.
 """
+
 from datetime import datetime
 from typing import Dict, Optional
 import logging
@@ -27,6 +28,7 @@ import sys
 from pathlib import Path
 import inspect
 import colorlog
+
 
 class ProjectLogger:
     """Manages project-wide logger instances and configuration.
@@ -41,9 +43,11 @@ class ProjectLogger:
         _log_dir (Optional[Path]): Directory path for log files.
         _base_config_set (bool): Flag indicating if logging configuration is set.
     """
+
     _loggers: Dict[str, logging.Logger] = {}
     _log_dir: Optional[Path] = None
     _base_config_set = False
+
     @classmethod
     def setup_project_logging(
         cls,
@@ -69,7 +73,7 @@ class ProjectLogger:
             return
 
         script_dir = Path(__file__).parent  # /path/to/repo/scripts
-        project_root = script_dir.parent     # /path/to/repo/
+        project_root = script_dir.parent  # /path/to/repo/
         cls._log_dir = Path(project_root / log_dir).resolve()
         cls._log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -81,12 +85,12 @@ class ProjectLogger:
             "%(log_color)s %(asctime)s - %(name)s - %(levelname)s - %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
             log_colors={
-                    'DEBUG': 'cyan',
-                    'INFO': 'white',
-                    'WARNING': 'yellow',
-                    'ERROR': 'red',
-                    'CRITICAL': 'red,bg_white',
-                },
+                "DEBUG": "cyan",
+                "INFO": "white",
+                "WARNING": "yellow",
+                "ERROR": "red",
+                "CRITICAL": "red,bg_white",
+            },
         )
 
         file_formatter = logging.Formatter(
@@ -94,6 +98,7 @@ class ProjectLogger:
             datefmt="%Y-%m-%d %H:%M:%S",
         )
         handlers = []
+        log_file = None
         if console_output:
             console_handler = logging.StreamHandler(sys.stdout)
             console_handler.setLevel(getattr(logging, log_level.upper()))
@@ -120,7 +125,7 @@ class ProjectLogger:
         setup_logger.info("Log Directory: %s", cls._log_dir.absolute())
         setup_logger.info("Console Output: %s", console_output)
         setup_logger.info("File Output: %s", file_output)
-        if file_output:
+        if file_output and log_file is not None:
             setup_logger.info("Log File: %s", log_file.name)
         setup_logger.info("=" * 60)
 
@@ -128,10 +133,10 @@ class ProjectLogger:
     def get_logger(cls, name: str = None) -> logging.Logger:
         """
         Get a logger instance for a specific module/component.
-        
+
         Args:
             name: Logger name. If None, uses the calling module's name.
-        
+
         Returns:
             Configured logger instance
         """
@@ -142,14 +147,14 @@ class ProjectLogger:
         if name is None:
             # Get the calling module's name
             frame = inspect.currentframe().f_back
-            name = frame.f_globals.get('__name__', 'unknown')
+            name = frame.f_globals.get("__name__", "unknown")
 
         if name not in cls._loggers:
             logger = logging.getLogger(name)
             cls._loggers[name] = logger
 
             # Log the logger creation
-            logger.info("📝 Logger '%s' initialized", name)
+            logger.info("Logger '%s' initialized", name)
 
         return cls._loggers[name]
 
@@ -165,7 +170,7 @@ class ProjectLogger:
             logger.info("Parameters:")
             for key, value in kwargs.items():
                 # Don't log sensitive information
-                sensitive_terms = ('password', 'token', 'key', 'secret')
+                sensitive_terms = ("password", "token", "key", "secret")
                 if any(t in key.lower() for t in sensitive_terms):
                     value = "***HIDDEN***"
                 logger.info("  %s: %s", key, value)
@@ -173,7 +178,9 @@ class ProjectLogger:
         return logger
 
     @classmethod
-    def log_function_end(cls, func_name: str, success: bool = True, **results) -> logging.Logger:
+    def log_function_end(
+        cls, func_name: str, success: bool = True, **results
+    ) -> logging.Logger:
         """Helper to log function completion."""
         logger = cls.get_logger()
 
@@ -192,18 +199,22 @@ class ProjectLogger:
         logger.info("=" * 50)
         return logger
 
+
 # Convenience functions for easy importing
 def get_logger(name: str = None) -> logging.Logger:
     """Get a project logger instance."""
     return ProjectLogger.get_logger(name)
 
+
 def setup_logging(**kwargs):
     """Set up project-wide logging configuration."""
     return ProjectLogger.setup_project_logging(**kwargs)
 
+
 def log_function_start(func_name: str, **kwargs) -> logging.Logger:
     """Log function start with parameters."""
     return ProjectLogger.log_function_start(func_name, **kwargs)
+
 
 def log_function_end(func_name: str, success: bool = True, **results) -> logging.Logger:
     """Log function completion."""
