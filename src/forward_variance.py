@@ -189,6 +189,9 @@ class ForwardVarianceCurve:
         quantiles = np.linspace(0, 100, n_knots + 2)
         internal_knots = np.percentile(T_market, quantiles[1:-1])
 
+        # Add this line to cast to the correct dtype
+        internal_knots = np.asarray(internal_knots, dtype=np.float64)
+
         # Ensure knots are strictly increasing and within bounds
         internal_knots = np.unique(internal_knots)
         internal_knots = internal_knots[
@@ -512,22 +515,22 @@ class ForwardVarianceCalculator:
 
         This method uses a market-based approach to forward variance:
         
-        1. Primary method (ATM IV²)**: Uses σ_ATM(T)² directly as the variance
-           swap rate θ(T) at each maturity. This is a model-free approach that
-           preserves the market's term structure shape and avoids numerical
-           instabilities of Carr-Madan at short maturities.
-           
-        2. Fallback (Carr-Madan)**: For maturities without ATM IV data, uses
-           the Carr-Madan variance swap formula, scaled to match nearby ATM IVs.
+        1. Primary method (ATM IV²): Uses σ_ATM(T)² directly as the variance
+        swap rate θ(T) at each maturity. This is a model-free approach that
+        preserves the market's term structure shape and avoids numerical
+        instabilities of Carr-Madan at short maturities.
+        
+        2. Fallback (Carr-Madan): For maturities without ATM IV data, uses
+        the Carr-Madan variance swap formula WITHOUT aggressive scaling.
 
         After computing θ(T) at market maturities, we fit ξ(t) such that:
 
             θ(T) = (1/T) ∫₀ᵀ ξ(t) dt
 
-        Using the exponential parameterization ξ(t) = exp(s(t)) for guaranteed positivity.
+        Using exponential parameterization ξ(t) = exp(s(t)) for guaranteed positivity.
         """
         log_function_start("carr_madan_forward_variance")
-        self.logger.info("Calculating forward variance using Carr-Madan method")
+        self.logger.info("Calculating forward variance using ATM IV² with CM fallback")
 
         if self.df is None:
             raise ValueError("Data not loaded. Call load_data() first.")
@@ -536,7 +539,7 @@ class ForwardVarianceCalculator:
 
         var_swaps = []
         maturities = []
-        n_options_at_maturity = []  # For weighting
+        n_options_at_maturity = []
 
         for maturity, group in maturity_groups:
             n_calls = len(group[group["cp_flag"] == "C"])
@@ -545,36 +548,28 @@ class ForwardVarianceCalculator:
 
             if n_total < 20 or n_calls < 5 or n_puts < 5:
                 self.logger.debug(
-                    "Insufficient calls (%d) or puts (%d) for maturity %f, skipping...",
-                    n_calls,
-                    n_puts,
-                    maturity,
+                    "Insufficient options for T=%f, skipping", maturity
                 )
                 continue
 
             forward = group["underlying_close"].iloc[0] * np.exp(
                 group["risk_free_rate"].iloc[0] * maturity
             )
-            theta = self._variance_swap_rate(group, forward, maturity)
+            theta = self._variance_swap_rate(group, forward, float(maturity))
 
-            # Relaxed bounds - let the optimisation handle extreme values
-            if 0.005 < theta < 25.0:  # More permissive than before
+            if 0.005 < theta < 25.0:
                 maturities.append(maturity)
                 var_swaps.append(theta)
                 n_options_at_maturity.append(n_total)
             else:
                 self.logger.warning(
-                    "Variance swap rate %.4f at T=%.4f outside reasonable bounds, skipping",
-                    theta,
-                    maturity,
+                    "Variance swap rate %.4f at T=%.4f outside bounds, skipping",
+                    theta, maturity
                 )
 
         if len(maturities) < 5:
-            self.logger.error(
-                "Insufficient valid maturities (%d) for fitting.", len(maturities)
-            )
-            # Fallback: constant forward variance at typical equity vol
-            self.logger.warning("Using constant fallback: ξ(t) = 0.225 (≈47.4%% vol)")
+            self.logger.error("Insufficient valid maturities (%d)", len(maturities))
+            self.logger.warning("Using constant fallback: ξ(t) = 0.225")
             self._fvc_wrapper = lambda t: np.full_like(np.atleast_1d(t), 0.225)
             self.theta_curve = lambda t: 0.225
             log_function_end("carr_madan_forward_variance")
@@ -582,99 +577,138 @@ class ForwardVarianceCalculator:
 
         T = np.array(maturities)
         theta_carr_madan = np.array(var_swaps)
-        weights = np.array(n_options_at_maturity, dtype=np.float64)
+        weights_cm = np.array(n_options_at_maturity, dtype=np.float64)
 
         self.logger.info(
-            "Fitting to %d maturities with Carr-Madan variance swaps in [%.4f, %.4f]",
-            len(T),
-            theta_carr_madan.min(),
-            theta_carr_madan.max(),
+            "Carr-Madan rates for %d maturities: [%.4f, %.4f]",
+            len(T), theta_carr_madan.min(), theta_carr_madan.max()
         )
 
         # ----------------------------------------------------------------- #
-        # HYBRID APPROACH: Scale Carr-Madan to match ATM IV² per maturity
+        # Extract ATM IV² for each maturity
         # ----------------------------------------------------------------- #
-        # Carr-Madan gives variance swap rates, but can be miscalibrated.
-        # ATM IV² is a reliable anchor point for each maturity.
-        # 
-        # Strategy:
-        # 1. Compute ATM IV² for each maturity (interpolating if needed)
-        # 2. Scale Carr-Madan θ(T) by the ratio ATM_IV²(T) / θ_CM(T)
-        # 3. This preserves Carr-Madan's relative shape while anchoring to market
-        # ----------------------------------------------------------------- #
-        
-        atm_iv_squared = np.zeros(len(T))
-        atm_iv_available = np.zeros(len(T), dtype=bool)
-        
+        atm_iv_squared = []
+        atm_maturities = []
+        atm_weights = []
+
         for i, T_i in enumerate(T):
             mat_df = self.df[np.abs(self.df["T_years"] - T_i) < 0.01]
-            if len(mat_df) > 0:
-                # Find ATM option (minimum |log-moneyness|)
-                atm_idx = mat_df["log_moneyness"].abs().idxmin()
-                atm_iv = mat_df.loc[atm_idx, "implied_volatility"]
-                log_m = mat_df.loc[atm_idx, "log_moneyness"]
-                
-                # Use if within reasonable range of ATM (|log-moneyness| < 0.3)
-                # and IV is valid. For options further from ATM, we interpolate
-                # to get a better ATM estimate.
-                if abs(log_m) < 0.3 and 0.05 < atm_iv < 3.0:
-                    # If not close to ATM, try to interpolate between call and put
-                    if abs(log_m) > 0.05:
-                        # Find options on both sides of ATM for interpolation
-                        otm_puts = mat_df[mat_df["log_moneyness"] < 0].sort_values("log_moneyness", ascending=False)
-                        otm_calls = mat_df[mat_df["log_moneyness"] > 0].sort_values("log_moneyness")
-                        
-                        if len(otm_puts) > 0 and len(otm_calls) > 0:
-                            # Linear interpolation to log_moneyness = 0
-                            put_row = otm_puts.iloc[0]
-                            call_row = otm_calls.iloc[0]
-                            lm_put, iv_put = put_row["log_moneyness"], put_row["implied_volatility"]
-                            lm_call, iv_call = call_row["log_moneyness"], call_row["implied_volatility"]
-                            
-                            # Interpolate IV at log_moneyness = 0
-                            if lm_call != lm_put:
-                                atm_iv = iv_put + (iv_call - iv_put) * (0 - lm_put) / (lm_call - lm_put)
-                    
-                    atm_iv_squared[i] = atm_iv ** 2
-                    atm_iv_available[i] = True
-        
-        n_atm_available = np.sum(atm_iv_available)
-        self.logger.info(
-            "ATM IV² available for %d of %d maturities (%.0f%%)",
-            n_atm_available, len(T), 100 * n_atm_available / len(T)
-        )
-        
-        # Use Carr-Madan variance swap rates, scaled by median ATM IV² ratio
-        # This preserves the term structure shape from Carr-Madan while 
-        # correcting the overall level to match market ATM volatilities.
-        theta = theta_carr_madan.copy()
-        
-        if n_atm_available >= 3:
-            comparison_mask = atm_iv_available & (theta_carr_madan > 0)
-            if np.any(comparison_mask):
-                ratios = atm_iv_squared[comparison_mask] / theta_carr_madan[comparison_mask]
-                median_ratio = np.median(ratios)
-                self.logger.info(
-                    "ATM IV² / Carr-Madan ratio: median=%.2f, range=[%.2f, %.2f]",
-                    median_ratio, ratios.min(), ratios.max()
+            if len(mat_df) == 0:
+                continue
+            
+            atm_idx = mat_df["log_moneyness"].abs().idxmin()
+            atm_iv = mat_df.loc[atm_idx, "implied_volatility"]
+            log_m = mat_df.loc[atm_idx, "log_moneyness"]
+            
+            if abs(log_m) < 0.05 and 0.05 < atm_iv < 3.0:
+                # Close to ATM, use directly
+                atm_iv_squared.append(atm_iv ** 2)
+                atm_maturities.append(T_i)
+                atm_weights.append(n_options_at_maturity[i])
+            elif abs(log_m) < 0.3 and 0.05 < atm_iv < 3.0:
+                # Interpolate to log_moneyness = 0
+                otm_puts = mat_df[mat_df["log_moneyness"] < 0].sort_values(
+                    "log_moneyness", ascending=False
+                )
+                otm_calls = mat_df[mat_df["log_moneyness"] > 0].sort_values(
+                    "log_moneyness"
                 )
                 
-                # Apply uniform scaling to preserve Carr-Madan term structure
-                # Only scale if there's a significant discrepancy
-                if median_ratio > 1.2 or median_ratio < 0.8:
-                    self.logger.info(
-                        "Scaling Carr-Madan variance swaps by %.2fx to match ATM IVs",
-                        median_ratio
-                    )
-                    theta = theta_carr_madan * median_ratio
-        
+                if len(otm_puts) > 0 and len(otm_calls) > 0:
+                    put_row = otm_puts.iloc[0]
+                    call_row = otm_calls.iloc[0]
+                    lm_put = put_row["log_moneyness"]
+                    iv_put = put_row["implied_volatility"]
+                    lm_call = call_row["log_moneyness"]
+                    iv_call = call_row["implied_volatility"]
+                    
+                    if (0.05 < iv_put < 3.0 and 
+                        0.05 < iv_call < 3.0 and 
+                        lm_call != lm_put):
+                        # Linear interpolation
+                        atm_iv_interp = (iv_put + 
+                                        (iv_call - iv_put) * 
+                                        (0 - lm_put) / (lm_call - lm_put))
+                        
+                        if 0.05 < atm_iv_interp < 3.0:
+                            atm_iv_squared.append(atm_iv_interp ** 2)
+                            atm_maturities.append(T_i)
+                            atm_weights.append(n_options_at_maturity[i])
+
+        n_atm = len(atm_iv_squared)
         self.logger.info(
-            "Using ATM IV² for forward variance: θ range [%.4f, %.4f] (σ: %.1f%% to %.1f%%)",
-            theta.min(), theta.max(), 
-            np.sqrt(theta.min()) * 100, np.sqrt(theta.max()) * 100
+            "ATM IV² available for %d of %d maturities (%.0f%%)",
+            n_atm, len(T), 100 * n_atm / len(T)
         )
 
-        # Create and fit the forward variance curve
+        # ----------------------------------------------------------------- #
+        # Decision logic: which variance swap rates to use
+        # ----------------------------------------------------------------- #
+
+        if n_atm >= max(5, int(0.5 * len(T))):
+            # PRIMARY: Use ATM IV² directly (most reliable)
+            theta = np.asarray(np.array(atm_iv_squared), dtype=np.float64)
+            T_fit = np.array(atm_maturities)
+            weights_fit = np.array(atm_weights, dtype=np.float64)
+
+            self.logger.info(
+                "Using ATM IV² directly: θ ∈ [%.4f, %.4f] (vol: %.1f%%-%.1f%%)",
+                theta.min(), theta.max(),
+                np.sqrt(theta.min())*100, np.sqrt(theta.max())*100
+            )
+
+        elif n_atm >= 3:
+            # HYBRID: Scale Carr-Madan conservatively to match ATM
+            cm_at_atm = []
+            atm_at_atm = []
+
+            for atm_T, atm_val in zip(atm_maturities, atm_iv_squared):
+                cm_idx = np.argmin(np.abs(T - atm_T))
+                if np.abs(T[cm_idx] - atm_T) < 0.01:
+                    cm_at_atm.append(theta_carr_madan[cm_idx])
+                    atm_at_atm.append(atm_val)
+
+            if len(cm_at_atm) >= 3:
+                ratios = np.array(atm_at_atm) / np.array(cm_at_atm)
+                median_ratio = np.median(ratios)
+
+                # CONSERVATIVE: cap scaling at [0.8, 1.0]
+                scale = min(1.0, max(0.8, median_ratio))
+
+                self.logger.info(
+                    "ATM/CM median ratio: %.2f, applying scale: %.2f",
+                    median_ratio, scale
+                )
+
+                theta = np.asarray(theta_carr_madan * scale, dtype=np.float64)
+                T_fit = T
+                weights_fit = weights_cm
+            else:
+                # Insufficient overlap: use Carr-Madan unscaled
+                self.logger.warning("Insufficient ATM/CM overlap, using CM unscaled")
+                theta = np.asarray(theta_carr_madan, dtype=np.float64)
+                T_fit = T
+                weights_fit = weights_cm
+
+        else:
+            # FALLBACK: Use Carr-Madan unscaled
+            self.logger.warning(
+                "Only %d ATM points, using Carr-Madan unscaled", n_atm
+            )
+            theta = np.asarray(theta_carr_madan, dtype=np.float64)
+            T_fit = T
+            weights_fit = weights_cm
+
+        self.logger.info(
+            "Final θ for fitting: [%.4f, %.4f] (vol: %.1f%%-%.1f%%)",
+            theta.min(), theta.max(),
+            np.sqrt(theta.min())*100, np.sqrt(theta.max())*100
+        )
+
+        # ----------------------------------------------------------------- #
+        # Fit forward variance curve ξ(t)
+        # ----------------------------------------------------------------- #
+        
         fvc = ForwardVarianceCurve(
             n_internal_knots=self.n_knots,
             regularisation_lambda=self.regularisation_lambda,
@@ -682,57 +716,50 @@ class ForwardVarianceCalculator:
         )
 
         try:
-            self.fit_result = fvc.fit(T, theta, weights=weights)
+            self.fit_result = fvc.fit(T_fit, theta, weights=weights_fit)
         except Exception as e:
             self.logger.error("Forward variance fitting failed: %s", str(e))
             self.logger.warning("Using constant fallback")
-            self._fvc_wrapper = lambda t: np.full_like(np.atleast_1d(t), np.mean(theta))
+            self._fvc_wrapper = lambda t: np.full_like(
+                np.atleast_1d(t), np.mean(theta)
+            )
             self.theta_curve = lambda t: np.mean(theta)
             log_function_end("carr_madan_forward_variance")
             return
 
         self.forward_variance_curve = fvc
 
-        # Wrapper for backward compatibility (returns array for any input)
         def xi_wrapper(t):
             return fvc.evaluate(np.atleast_1d(t))
 
         self._fvc_wrapper = xi_wrapper
-
-        # Variance swap rate curve
         self.theta_curve = lambda t: fvc.get_variance_swap_rate(t)
 
-        # Verify the fit
-        fitted_theta = np.array([fvc.get_variance_swap_rate(t) for t in T])
-        fit_error = np.sqrt(np.mean((np.log(fitted_theta) - np.log(theta)) ** 2))
-
+        # Verify fit quality
+        fitted_theta = np.array([fvc.get_variance_swap_rate(t) for t in T_fit])
+        fit_error = np.sqrt(np.mean((np.log(fitted_theta) - np.log(theta))**2))
         self.logger.info("Forward variance fit RMSE (log-space): %.6f", fit_error)
 
-        # diagnostics logging
+        # Diagnostics
         xi_0 = fvc.evaluate(0.01)
         xi_half = fvc.evaluate(0.5)
         xi_1 = fvc.evaluate(1.0)
-        xi_2 = fvc.evaluate(2.0) if T.max() > 2.0 else fvc.evaluate(T.max())
+        xi_max = fvc.evaluate(min(2.0, T_fit.max()))
 
         self.logger.info("Forward variance diagnostics:")
-        self.logger.info(
-            "  ξ(0.01) = %.4f (%.1f%% instantaneous vol)", xi_0, np.sqrt(xi_0) * 100
-        )
-        self.logger.info(
-            "  ξ(0.50) = %.4f (%.1f%% vol)", xi_half, np.sqrt(xi_half) * 100
-        )
-        self.logger.info("  ξ(1.00) = %.4f (%.1f%% vol)", xi_1, np.sqrt(xi_1) * 100)
-        self.logger.info("  ξ(max)  = %.4f (%.1f%% vol)", xi_2, np.sqrt(xi_2) * 100)
+        self.logger.info("  ξ(0.01) = %.4f (%.1f%% vol)", xi_0, np.sqrt(xi_0)*100)
+        self.logger.info("  ξ(0.50) = %.4f (%.1f%% vol)", xi_half, np.sqrt(xi_half)*100)
+        self.logger.info("  ξ(1.00) = %.4f (%.1f%% vol)", xi_1, np.sqrt(xi_1)*100)
+        self.logger.info("  ξ(max)  = %.4f (%.1f%% vol)", xi_max, np.sqrt(xi_max)*100)
 
-        # Verify positivity (should always pass with exponential parameterization)
-        t_test = np.linspace(0.01, T.max() * 1.2, 100)
+        # Verify positivity
+        t_test = np.linspace(0.01, T_fit.max() * 1.2, 100)
         xi_test = fvc.evaluate(t_test)
         if np.any(xi_test <= 0):
-            self.logger.error(
-                "CRITICAL: Forward variance not positive! Min = %.6f", xi_test.min()
-            )
+            self.logger.error("CRITICAL: Forward variance not positive! Min = %.6f",
+                            np.min(xi_test))
         else:
-            self.logger.info("Positivity verified: min(ξ) = %.6f", xi_test.min())
+            self.logger.info("Positivity verified: min(ξ) = %.6f", np.min(xi_test))
 
         log_function_end("carr_madan_forward_variance")
 
@@ -840,7 +867,7 @@ class ForwardVarianceCalculator:
         # Find ATM option (minimum log-moneyness)
         atm_idx = df["log_moneyness"].abs().idxmin()
         iv_atm = df.loc[atm_idx, "implied_volatility"]
-        return iv_atm**2
+        return float(iv_atm) ** 2
 
     def save_data(self):
         """
@@ -853,6 +880,11 @@ class ForwardVarianceCalculator:
 
         if self._fvc_wrapper is None:
             self.logger.error("Cannot save: forward variance curve not computed.")
+            log_function_end("save_data")
+            return
+
+        if self.df is None:
+            self.logger.error("Cannot save: market data not loaded. Call load_data() first.")
             log_function_end("save_data")
             return
 
@@ -983,7 +1015,7 @@ class ForwardVarianceCalculator:
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="forward_variance")
-def main(cfg: Optional[DictConfig] = None):
+def main(cfg: DictConfig):
     """
     Main entry point for forward variance calculation.
 
