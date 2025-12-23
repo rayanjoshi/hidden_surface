@@ -1,11 +1,9 @@
-.venv/
-.env
-*.egg-info/
-*/__pycache__/
-build/
 outputs
-data
-logs
+*.csv
+*.png
+*.svg
+*.json
+*.npy
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
