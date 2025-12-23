@@ -14,16 +14,22 @@ Dependencies:
     - wrds
     - scripts.logging_config
 """
+
 import os
-from typing import Optional
 from pathlib import Path
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 import hydra
 import wrds
-from scripts.logging_config import get_logger, setup_logging, log_function_start, log_function_end
+from scripts.logging_config import (
+    get_logger,
+    setup_logging,
+    log_function_start,
+    log_function_end,
+)
 
 load_dotenv()
+
 
 class DataLoader:
     """
@@ -39,10 +45,10 @@ class DataLoader:
         sql_query_path (Path): Resolved path to the SQL query file.
         save_path (Path): Resolved path where the data will be saved as CSV.
     """
+
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
-        self.db = None
         self.logger = get_logger("DataLoader")
         self.username = os.getenv("WRDS_USERNAME")
         self.password = os.getenv("WRDS_PASSWORD")
@@ -62,7 +68,9 @@ class DataLoader:
         """
         log_function_start("connect_to_database")
         self.logger.info("Connecting to WRDS database")
-        self.db = wrds.Connection(wrds_username=self.username, wrds_password=self.password)
+        self.db = wrds.Connection(
+            wrds_username=self.username, wrds_password=self.password
+        )
         self.db.create_pgpass_file()
         self.logger.info("Successfully connected to WRDS database")
         log_function_end("connect_to_database")
@@ -79,11 +87,15 @@ class DataLoader:
         log_function_start("load_data")
         self.logger.info("Loading data from OptionMetrics")
         self.logger.info("Executing SQL query from %s", self.sql_query_path)
+
         with open(self.sql_query_path, "r", encoding="utf-8") as file:
             sql_query = file.read()
+
         df = self.db.raw_sql(sql_query)
+
         if df.empty:
             self.logger.warning("No data returned from SQL query")
+
         log_function_end("load_data")
         return df
 
@@ -103,11 +115,11 @@ class DataLoader:
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="data_loader")
-def main(cfg: Optional[DictConfig] = None):
+def main(cfg: DictConfig):
     """
     Main function to orchestrate the data loading process.
 
-    Initializes logging, creates a DataLoader instance, connects to the database,
+    Initialises logging, creates a DataLoader instance, connects to the database,
     loads data, and saves it to a CSV file.
 
     Args:
@@ -120,6 +132,7 @@ def main(cfg: Optional[DictConfig] = None):
     data_loader.connect_to_database()
     df = data_loader.load_data()
     data_loader.save_data(df)
+
 
 if __name__ == "__main__":
     main()
