@@ -1,5 +1,7 @@
 defaults:
   - data_loader
   - data_processor
+  - select_date
   - surface_builder
   - forward_variance
+  - rbergomi_model
