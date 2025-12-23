@@ -1,4 +1,5 @@
 defaults:
+  - _self_
   - select_date
 
 f_variance:
@@ -28,3 +29,19 @@ variance_swap:
   # Monte Carlo parameters for variance swap pricing
   n_paths: 100000
   n_steps: 2048
+
+barrier_option:
+  maturity: 1.0                  # Main maturity to price (years)
+  strike: 1.0                    # Normalised strike (1.0 = ATM)
+  option_type: put               # 'put' or 'call'
+  rebate: 0.0                    # Rebate on knock-out (usually 0)
+  n_paths: 100000                # Monte Carlo paths (use antithetic → effective ~200k)
+  n_steps: 4096                  # High resolution for accurate continuous barrier monitoring
+
+  # Barrier levels to price, grouped by type
+  # Use normalised levels (S0 = 1.0)
+  barriers:
+    down_and_out: [0.70, 0.80, 0.85, 0.90, 0.95]
+    up_and_out:   [1.05, 1.10, 1.15, 1.20, 1.30]
+    down_and_in:  [0.80, 0.90]                   # Fewer levels typical for knock-in
+    up_and_in:    [1.10, 1.20]
