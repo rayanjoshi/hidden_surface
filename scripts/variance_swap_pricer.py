@@ -356,7 +356,7 @@ class VarianceSwapPricer:
 
 
 @hydra.main(
-    version_base=None, config_path="../../configs", config_name="rbergomi_model"
+    version_base=None, config_path="../configs", config_name="rbergomi_model"
 )
 def main(cfg: DictConfig):
     """
@@ -373,8 +373,8 @@ def main(cfg: DictConfig):
     logger.info("=" * 70)
 
     # Paths
-    script_dir = Path(__file__).parent
-    repo_root = script_dir.parent.parent
+    script_dir = Path(__file__).parent.resolve()
+    repo_root = script_dir.parent
 
     # Load calibration results
     calibration_file = Path(

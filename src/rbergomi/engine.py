@@ -19,10 +19,10 @@ import pandas as pd
 from pathlib import Path
 
 
-from rbergomi.convolution import precompute_convolution_matrix
-from rbergomi.simulation import simulate_rbergomi_paths
-from rbergomi.black_scholes import implied_volatility, compute_vega_scalar
-from src.rbergomi.calibration_result import CalibrationResult
+from .convolution import precompute_convolution_matrix
+from .simulation import simulate_rbergomi_paths
+from .black_scholes import implied_volatility, compute_vega_scalar
+from .calibration_result import CalibrationResult
 from scripts.logging_config import get_logger
 
 
