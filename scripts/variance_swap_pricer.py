@@ -70,9 +70,9 @@ class VarianceSwapPricer:
         )
 
         # Load forward variance curve
-        script_dir = Path(__file__).parent
-        repo_root = script_dir.parent.parent
-        f_variance_path = Path(repo_root / cfg.f_variance.output_path).resolve()
+        script_dir = Path(__file__).parent.resolve()
+        repo_root = script_dir.parent
+        f_variance_path = Path(repo_root / cfg.f_variance.output_path)
 
         self.logger.info("Loading forward variance from %s", f_variance_path)
         self.df = pd.read_csv(f_variance_path)
@@ -350,6 +350,8 @@ class VarianceSwapPricer:
         save_path.mkdir(parents=True, exist_ok=True)
         plot_file = save_path / "variance_swap_pricing.svg"
         plt.savefig(plot_file, format="svg", bbox_inches="tight")
+        plot_file = save_path / "variance_swap_pricing.png"
+        plt.savefig(plot_file, format="png", dpi=1200, bbox_inches="tight")
         self.logger.info("Plot saved to %s", plot_file)
 
         plt.close()

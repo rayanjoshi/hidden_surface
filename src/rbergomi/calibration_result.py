@@ -63,11 +63,13 @@ class CalibrationResult:
         ax.set_ylabel("Implied Volatility")
 
         self.save_path.mkdir(parents=True, exist_ok=True)
-        self.save_path = self.save_path / "market_vs_model_iv.svg"
-        plt.savefig(self.save_path, format="svg")
-        np.save(self.save_path.with_name("fitted_ivs.npy"), self.fitted_ivs)
-        np.save(self.save_path.with_name("market_ivs.npy"), self.market_ivs)
-
+        svg_path = self.save_path / "market_vs_model_iv.svg"
+        png_path = self.save_path / "market_vs_model_iv.png"
+        plt.savefig(png_path, format="png", dpi = 1200)
+        plt.savefig(svg_path, format="svg")
+    
+        np.save(self.save_path / "fitted_ivs.npy", self.fitted_ivs)
+        np.save(self.save_path / "market_ivs.npy", self.market_ivs)
     def generate_report(self) -> Dict:
         """
         Generate a dictionary report of calibration results.

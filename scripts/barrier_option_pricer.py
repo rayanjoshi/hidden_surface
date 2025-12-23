@@ -679,8 +679,10 @@ def main(cfg: DictConfig):
     # Plot comparison (only for knock-out barriers)
     if comparison_df is not None and not comparison_df.empty:
         logger.info("\nGenerating comparison plot...")
-        plot_file = save_path / "barrier_option_comparison.svg"
-        pricer.plot_barrier_comparison(comparison_df, save_path=plot_file)
+        plot_svg_file = save_path / "barrier_option_comparison.svg"
+        pricer.plot_barrier_comparison(comparison_df, save_path=plot_svg_file)
+        plot_png_file = save_path / "barrier_option_comparison.png"
+        pricer.plot_barrier_comparison(comparison_df, save_path=plot_png_file)
 
     # Summary
     logger.info("\n" + "=" * 70)
