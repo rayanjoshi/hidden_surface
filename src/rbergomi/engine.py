@@ -482,7 +482,7 @@ class RoughBergomiEngine:
             gtol=1e-6,
             xtol=1e-8,
             loss="soft_l1",  # Robust to outliers
-            verbose=2,
+            verbose=0,
         )
 
         optimal_params = res.x
