@@ -106,7 +106,7 @@ class ProjectLogger:
             handlers.append(console_handler)
         if file_output:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_file = cls._log_dir / f"nvda_predictor_{timestamp}.log"
+            log_file = cls._log_dir / f"rbergomi_{timestamp}.log"
             file_handler = logging.FileHandler(log_file)
             file_handler.setLevel(getattr(logging, log_level.upper()))
             file_handler.setFormatter(file_formatter)
