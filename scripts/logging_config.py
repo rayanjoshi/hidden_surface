@@ -6,7 +6,7 @@ colored console output and structured logging to a timestamped file. The module
 includes a `ProjectLogger` class for managing logger instances and convenience
 functions for easy access to logging functionality.
 
-The logging system is designed to be initialized once per project run, with
+The logging system is designed to be initialised once per project run, with
 configurable log levels, output destinations, and file storage. It also provides
 helper methods to log function start and end events, including parameters and
 results, while ensuring sensitive information is obscured.
@@ -56,7 +56,7 @@ class ProjectLogger:
         console_output: bool = True,
         file_output: bool = True,
     ):
-        """Initialize project-wide logging configuration.
+        """Initialise project-wide logging configuration.
 
         Sets up the root logger with console and/or file handlers based on input
         parameters. Creates a log directory if it doesn't exist and configures
@@ -119,7 +119,7 @@ class ProjectLogger:
 
         setup_logger = cls.get_logger("logging_setup")
         setup_logger.info("=" * 60)
-        setup_logger.info("PROJECT LOGGING INITIALIZED")
+        setup_logger.info("PROJECT LOGGING INITIALISED")
         setup_logger.info("=" * 60)
         setup_logger.info("Log Level: %s", log_level)
         setup_logger.info("Log Directory: %s", cls._log_dir.absolute())
@@ -154,7 +154,7 @@ class ProjectLogger:
             cls._loggers[name] = logger
 
             # Log the logger creation
-            logger.info("Logger '%s' initialized", name)
+            logger.info("Logger '%s' initialised", name)
 
         return cls._loggers[name]
 
