@@ -969,12 +969,12 @@ class MarketSurfaceBuilder:
         plt.savefig(save_path, format="png", dpi=300, bbox_inches="tight")
         self.logger.info("Saved term structure to %s", save_path)
 
-        plt.close(fig)
+        plt.close('all')
         log_function_end("plot_term_structure")
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="surface_builder")
-def main(cfg: Optional[DictConfig] = None):
+def main(cfg: DictConfig):
     """
     Main entry point for constructing the market surface.
 

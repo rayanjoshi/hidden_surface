@@ -67,6 +67,7 @@ class CalibrationResult:
         png_path = self.save_path / "market_vs_model_iv.png"
         plt.savefig(png_path, format="png", dpi = 1200)
         plt.savefig(svg_path, format="svg")
+        plt.close('all')
     
         np.save(self.save_path / "fitted_ivs.npy", self.fitted_ivs)
         np.save(self.save_path / "market_ivs.npy", self.market_ivs)

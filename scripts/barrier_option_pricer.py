@@ -543,9 +543,9 @@ class BarrierOptionPricer:
         plt.tight_layout()
 
         if save_path:
-            plt.savefig(save_path, format="svg", dpi=300, bbox_inches="tight")
+            plt.savefig(save_path, bbox_inches="tight", dpi=1200)
             self.logger.info("Plot saved to %s", save_path)
-
+        plt.close(fig)
 
 @hydra.main(
     version_base=None, config_path="../configs", config_name="rbergomi_model"
