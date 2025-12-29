@@ -1,7 +1,7 @@
 [project]
 name = "hidden_surface"
 version = "1.0.0"
-description = "Simulating and Viewing the Rough Bergomi Model"
+description = "Numba-accelerated Rough Bergomi volatility model for derivatives pricing."
 authors = [{ name = "Rayan Joshi", email = "rayanjoshi@hotmail.co.uk" }]
 readme = "README.md"
 requires-python = ">=3.10"
