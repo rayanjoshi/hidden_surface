@@ -21,7 +21,7 @@ Key Features
 
 References
 ----------
-- Rough Bergomi (2008) - Christian Bayer, Peter Friz, Jim Gatheral
+- Rough Bergomi (2016) - Christian Bayer, Peter Friz, Jim Gatheral
 - "Hybrid scheme for Brownian semistationary processes" - Bennedsen, Lunde, Pakkanen (2017)
 
 Dependencies:

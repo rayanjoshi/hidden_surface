@@ -35,6 +35,7 @@ This project is licensed under the MIT License. It uses OptionMetrics data acces
 - [Workflow Overview](#workflow-overview)
 - [Results](#results)
 - [License](#license)
+- [References](#references)
 
 ## Academic Purpose
 
@@ -273,7 +274,7 @@ The complete calibration and validation pipeline consists of seven sequential st
 
 <img src="assets/market_vs_model_iv.png" alt="Calibration Fit" width="800"/>
 
-*Figure 2: Market vs. model implied volatilities across maturities and strikes. Calibrated Rough Bergomi parameters: η ≈ 3.2, H ≈ 0.07, ρ ≈ -0.85. Vega-weighted RMSE: ~1.2%. Data accessed via WRDS OptionMetrics; visualisation is a derived work for academic purposes only.*
+*Figure 2: Market vs. model implied volatilities across maturities and strikes. Calibrated Rough Bergomi parameters: η ≈ 0.1, H ≈ 0.2, ρ ≈ -0.01. Vega-weighted RMSE: ~4.1%. Data accessed via WRDS OptionMetrics; visualisation is a derived work for academic purposes only.*
 
 ### Barrier Option Pricing vs. Black-Scholes
 
@@ -296,3 +297,9 @@ The complete calibration and validation pipeline consists of seven sequential st
 This repository is released under the MIT License — see [LICENSE](LICENSE).
 
 **Disclaimer**: All code in this repository is licensed under the MIT License. Visualisations and results derived from WRDS data are included for academic and educational purposes only. No raw WRDS data is included. WRDS and its data providers retain all rights to the underlying data. Use of WRDS data is subject to their [Terms of Use](https://wrds-www.wharton.upenn.edu/users/tou/).
+
+## References
+
+- Bayer, C., Friz, P., & Gatheral, J. (2016). Pricing under rough volatility. *Quantitative Finance*, 16(6), 887–904. https://doi.org/10.1080/14697688.2015.1099717 (also available on SSRN: https://ssrn.com/abstract=2554754)
+
+- Bennedsen, M., Lunde, A., & Pakkanen, M. S. (2017). Hybrid scheme for Brownian semistationary processes. *Finance and Stochastics*, 21(4), 931–965. https://doi.org/10.1007/s00780-017-0335-3
